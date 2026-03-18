@@ -409,6 +409,12 @@ class LiveAdapter:
                 if msg is not None:
                     raw_messages.append(msg)
 
+        # Filter out empty content before enforcing alternation
+        raw_messages = [
+            m for m in raw_messages
+            if m.get("content", "").strip()
+        ]
+
         # Enforce alternation
         return self._enforce_alternation(raw_messages)
 
