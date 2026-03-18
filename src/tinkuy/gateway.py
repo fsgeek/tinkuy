@@ -1,13 +1,13 @@
 """Gateway — the integration layer that sits in the wire.
 
-The gateway is the entry point. It receives client requests,
-feeds them through the orchestrator, synthesizes API payloads,
-and returns responses. It owns the lifecycle of all components.
+The gateway is the entry point. It receives raw client request
+bodies, feeds them through the orchestrator, synthesizes API
+payloads, and returns complete upstream bodies. It owns the
+full request→response transformation. DEATH TO PROXIES.
 
-This is NOT an HTTP server or proxy. It's a Python object that
-a harness (CLI, HTTP server, test fixture) drives. The harness
-decides how to receive requests and deliver responses. The
-gateway decides what happens between those two points.
+The harness (HTTP server, CLI, test fixture) is a dumb pipe.
+It hands raw bytes to the gateway and forwards whatever comes
+back. It never sees, touches, or transforms message content.
 
 Three modes of operation:
   1. Live — process a single turn (request → response)
@@ -18,9 +18,12 @@ Three modes of operation:
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+
+log = logging.getLogger("tinkuy.gateway")
 
 from tinkuy.adapter import IngestAdapter, LiveAdapter
 from tinkuy.events import ConsoleStatusConsumer, EventBus, EventLog
@@ -249,6 +252,84 @@ class Gateway:
 
         return record
 
+    # --- Raw request/response boundary (DEATH TO PROXIES) ---
+
+    def prepare_request(self, client_body: dict[str, Any]) -> dict[str, Any]:
+        """Accept a raw client request body, return a complete upstream body.
+
+        This is THE boundary. The client body enters, the gateway's
+        projection-synthesized payload exits. The HTTP layer calls this
+        and forwards the result. It never touches message content.
+        """
+        request_messages = client_body.get("messages", [])
+        user_content, tool_results = _extract_user_content(request_messages)
+
+        log.info(
+            "← request | session=%s stream=%s model=%s "
+            "client_messages=%d user_content_len=%d tool_results=%d",
+            self.config.session_id or "default",
+            client_body.get("stream", False),
+            client_body.get("model", "?"),
+            len(request_messages),
+            len(user_content) if user_content else 0,
+            len(tool_results) if tool_results else 0,
+        )
+
+        # Always process through the gateway — no exceptions, no fallback
+        turn_result = self.process_turn(
+            user_content=user_content or "",
+            tool_results=tool_results,
+        )
+
+        # Build complete upstream body: client's non-message fields +
+        # gateway's synthesized messages and system prompt
+        upstream: dict[str, Any] = {
+            k: v for k, v in client_body.items()
+            if k not in ("messages", "system")
+        }
+        upstream["messages"] = turn_result.api_payload.get("messages", [])
+
+        # Merge system prompts: preserve client's, append gateway's
+        gateway_system = turn_result.api_payload.get("system")
+        client_system = client_body.get("system")
+        if gateway_system is not None and client_system is not None:
+            upstream["system"] = _merge_system(client_system, gateway_system)
+        elif gateway_system is not None:
+            upstream["system"] = gateway_system
+        elif client_system is not None:
+            upstream["system"] = client_system
+
+        log.info(
+            "  synth | messages=%d system=%s",
+            len(upstream.get("messages", [])),
+            "yes" if "system" in upstream else "no",
+        )
+
+        return upstream
+
+    def ingest_raw_response(self, text: str) -> TurnRecord | None:
+        """Ingest raw assistant response text.
+
+        Extracts cooperative memory signals, strips them, and feeds
+        the clean text into the orchestrator. The HTTP layer collects
+        text from the SSE stream and hands it here. It never parses
+        message content.
+        """
+        if not text:
+            return None
+        from tinkuy.harness import extract_signals, strip_signals
+        signals = extract_signals(text)
+        clean = strip_signals(text)
+        return self.ingest_response(
+            content=clean,
+            signals=signals if signals else None,
+        )
+
+    def ingest_response_json(self, response_data: dict[str, Any]) -> TurnRecord | None:
+        """Ingest a complete Anthropic API response JSON."""
+        text = _extract_response_text(response_data)
+        return self.ingest_raw_response(text)
+
     # --- Convenience ---
 
     @property
@@ -309,3 +390,90 @@ class Gateway:
             )
         else:
             raise ValueError(f"Unknown signal type: {signal_type}")
+
+
+# --- Helpers (owned by the gateway, not the HTTP layer) ---
+
+
+def _extract_user_content(
+    messages: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, str]] | None]:
+    """Extract user content and tool results from the last turn.
+
+    This parses Anthropic message format. It lives here because
+    understanding message content is gateway logic, not HTTP logic.
+    """
+    user_parts: list[str] = []
+    tool_results: list[dict[str, str]] = []
+
+    # Walk backwards to find the last user turn
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            break
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            user_parts.insert(0, content)
+        elif isinstance(content, list):
+            for block in content:
+                if block.get("type") == "text":
+                    user_parts.insert(0, block.get("text", ""))
+                elif block.get("type") == "tool_result":
+                    result = block.get("content", "")
+                    if isinstance(result, list):
+                        result = " ".join(
+                            b.get("text", "") for b in result
+                            if b.get("type") == "text"
+                        )
+                    tool_results.insert(0, {
+                        "content": str(result),
+                        "name": block.get("tool_use_id", "tool"),
+                    })
+
+    return "\n".join(user_parts), tool_results or None
+
+
+def _merge_system(
+    client_system: Any,
+    gateway_system: Any,
+) -> Any:
+    """Merge client's system prompt with gateway additions (page table).
+
+    The client's system prompt is preserved as-is. Gateway additions
+    are appended only if they contain content not already present in
+    the client's system. cache_control is stripped from gateway
+    additions since the client owns caching strategy.
+    """
+    # Normalize both to lists
+    if isinstance(client_system, str):
+        client_parts = [{"type": "text", "text": client_system}]
+    elif isinstance(client_system, list):
+        client_parts = list(client_system)
+    else:
+        client_parts = []
+
+    if isinstance(gateway_system, str):
+        gw_parts = [{"type": "text", "text": gateway_system}]
+    elif isinstance(gateway_system, list):
+        gw_parts = [{k: v for k, v in p.items() if k != "cache_control"}
+                     for p in gateway_system]
+    else:
+        gw_parts = []
+
+    # Deduplicate: only append gateway parts whose text isn't already
+    # present in the client system
+    client_texts = {p.get("text", "") for p in client_parts
+                    if isinstance(p, dict)}
+    new_parts = [p for p in gw_parts
+                 if isinstance(p, dict) and p.get("text", "") not in client_texts]
+
+    return client_parts + new_parts
+
+
+def _extract_response_text(resp_data: dict[str, Any]) -> str:
+    """Extract text content from an Anthropic API response."""
+    content = resp_data.get("content", [])
+    parts = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append(block.get("text", ""))
+    return "\n".join(parts)

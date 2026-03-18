@@ -19,7 +19,7 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command")
 
     # serve
-    serve_p = sub.add_parser("serve", help="Start the tinkuy proxy gateway")
+    serve_p = sub.add_parser("serve", help="Start the tinkuy gateway")
     serve_p.add_argument(
         "--port", type=int, default=None,
         help="Port to listen on (default: auto-detect free port)",
@@ -40,7 +40,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.command == "serve":
-        from tinkuy.proxy import serve
+        from tinkuy.server import serve
         serve(
             port=args.port,
             upstream=args.upstream,

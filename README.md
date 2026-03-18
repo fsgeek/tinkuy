@@ -41,7 +41,7 @@ Tinkuy is virtual memory for transformer context windows. It manages eviction, c
 # Install
 pip install tinkuy
 
-# Install with proxy support
+# Install with server support
 pip install tinkuy[serve]
 
 # Start the gateway
@@ -79,7 +79,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:8340
 | `adapter.py` | Ingest (rehydrate) + synthesize (live) |
 | `gateway.py` | Integration layer |
 | `harness.py` | Session driver, signal extraction |
-| `proxy.py` | FastAPI HTTP proxy |
+| `server.py` | FastAPI HTTP server (dumb pipe — gateway owns content) |
 
 ## Usage as a library
 

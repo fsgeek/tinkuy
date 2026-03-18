@@ -150,10 +150,10 @@ class EventLog(EventConsumer):
 
 
 class ConsoleStatusConsumer(EventConsumer):
-    """Renders a console status line, similar to Pichay's live status.
+    """Renders a console status line with telemetry for algorithm development.
 
-    Tracks pressure state and emits formatted status on pressure
-    changes and turn boundaries.
+    Tracks pressure state, evictions, faults, and timing to surface
+    the data needed to evaluate and tune eviction algorithms.
     """
 
     def __init__(
@@ -166,31 +166,91 @@ class ConsoleStatusConsumer(EventConsumer):
         self._last_zone: str | None = None
         self._total_tokens: int = 0
         self._turn: int = 0
+        # Per-turn counters (reset on TURN_BEGAN)
+        self._evictions_this_turn: int = 0
+        self._faults_this_turn: int = 0
+        self._fault_ages: list[float] = []  # seconds since eviction
+        # Cumulative counters
+        self._total_evictions: int = 0
+        self._total_faults: int = 0
+        # Timing
+        self._turn_start: float = time.time()
+        self._last_turn_end: float | None = None
 
     def on_event(self, event: Event) -> None:
         if event.kind == EventKind.PRESSURE_READ:
             self._total_tokens = event.data.get("total_tokens", 0)
             zone = event.data.get("zone", "unknown")
-            if zone != self._last_zone or event.kind == EventKind.TURN_BEGAN:
+            if zone != self._last_zone:
                 self._last_zone = zone
-                self._render()
+                self._render_status()
 
         elif event.kind == EventKind.TURN_BEGAN:
+            # Render summary of *previous* turn before resetting
+            if self._turn > 0:
+                self._render_summary()
+                self._last_turn_end = time.time()
+            self._turn_start = time.time()
             self._turn = event.turn
-            self._render()
+            self._evictions_this_turn = 0
+            self._faults_this_turn = 0
+            self._fault_ages = []
+            self._render_status()
 
-    def _render(self) -> None:
+        elif event.kind in (
+            EventKind.EVICTION_EXECUTED, EventKind.BLOCK_EVICTED,
+        ):
+            self._evictions_this_turn += 1
+            self._total_evictions += 1
+
+        elif event.kind == EventKind.BLOCK_RECALLED:
+            self._faults_this_turn += 1
+            self._total_faults += 1
+            evicted_at = event.data.get("evicted_at")
+            if evicted_at is not None:
+                self._fault_ages.append(time.time() - evicted_at)
+
+    def _render_status(self) -> None:
+        """Render the turn-start status line with gap timing."""
         usage_pct = (
             (self._total_tokens / self.context_limit * 100)
             if self.context_limit > 0 else 100
         )
+        gap = ""
+        if self._last_turn_end is not None:
+            gap_s = self._turn_start - self._last_turn_end
+            gap = f" | gap:{self._fmt_duration(gap_s)}"
         line = (
             f"Context: {self._total_tokens:,}/{self.context_limit:,} tok "
             f"({usage_pct:.0f}%) | "
             f"Pressure: {self._last_zone or 'unknown'} | "
-            f"Turn: {self._turn}"
+            f"Turn: {self._turn}{gap}"
         )
         self._render_fn(line)
+
+    def _render_summary(self) -> None:
+        """Render end-of-turn summary with eviction/fault telemetry."""
+        parts = [f"  Turn {self._turn}"]
+        if self._evictions_this_turn > 0 or self._total_evictions > 0:
+            parts.append(f"ev:{self._evictions_this_turn}")
+        if self._faults_this_turn > 0 or self._total_faults > 0:
+            fault_str = f"faults:{self._faults_this_turn}/{self._total_faults}"
+            if self._fault_ages:
+                avg_age = sum(self._fault_ages) / len(self._fault_ages)
+                fault_str += f" avg_age:{self._fmt_duration(avg_age)}"
+            parts.append(fault_str)
+        # Only render if there's something beyond the turn number
+        if len(parts) > 1:
+            self._render_fn(" | ".join(parts))
+
+    @staticmethod
+    def _fmt_duration(seconds: float) -> str:
+        """Format seconds as a human-readable duration."""
+        if seconds < 60:
+            return f"{seconds:.0f}s"
+        if seconds < 3600:
+            return f"{seconds / 60:.1f}m"
+        return f"{seconds / 3600:.1f}h"
 
     @staticmethod
     def _default_render(line: str) -> None:

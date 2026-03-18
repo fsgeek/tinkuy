@@ -1,10 +1,11 @@
-"""Tests for proxy helper behavior and app wiring."""
+"""Tests for server helper behavior and app wiring."""
 
 import builtins
 
 import pytest
 
-from tinkuy import proxy
+from tinkuy import server
+from tinkuy import gateway as gw_mod
 
 
 def test_find_free_port_returns_int():
@@ -25,9 +26,9 @@ def test_find_free_port_returns_int():
         return FakeSocket()
 
     monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(proxy.socket, "socket", fake_socket)
+    monkeypatch.setattr(server.socket, "socket", fake_socket)
     try:
-        port = proxy.find_free_port()
+        port = server.find_free_port()
     finally:
         monkeypatch.undo()
 
@@ -42,7 +43,7 @@ def test_extract_user_content_parses_simple_text_messages():
         {"role": "user", "content": "second"},
     ]
 
-    user_content, tool_results = proxy._extract_user_content(messages)
+    user_content, tool_results = gw_mod._extract_user_content(messages)
 
     assert user_content == "first\nsecond"
     assert tool_results is None
@@ -67,7 +68,7 @@ def test_extract_user_content_parses_content_blocks_and_tool_results():
         },
     ]
 
-    user_content, tool_results = proxy._extract_user_content(messages)
+    user_content, tool_results = gw_mod._extract_user_content(messages)
 
     assert user_content == "please use tool"
     assert tool_results == [{"content": "alpha beta", "name": "toolu_123"}]
@@ -84,7 +85,7 @@ def test_extract_response_text_reads_anthropic_text_blocks():
         ],
     }
 
-    assert proxy._extract_response_text(resp_data) == "line 1\nline 2"
+    assert gw_mod._extract_response_text(resp_data) == "line 1\nline 2"
 
 
 def test_create_app_returns_fastapi_with_expected_routes_and_health():
@@ -92,15 +93,7 @@ def test_create_app_returns_fastapi_with_expected_routes_and_health():
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
 
-    # FastAPI resolves forward refs from module globals; seed these symbols.
-    monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(proxy, "Request", fastapi.Request, raising=False)
-    monkeypatch.setattr(proxy, "Response", fastapi.Response, raising=False)
-
-    try:
-        app = proxy.create_app()
-    finally:
-        monkeypatch.undo()
+    app = server.create_app()
 
     assert isinstance(app, fastapi.FastAPI)
 
@@ -134,4 +127,4 @@ def test_serve_raises_importerror_when_uvicorn_unavailable(monkeypatch):
         ImportError,
         match=r"Serving requires extra dependencies\. Install with: pip install tinkuy\[serve\]",
     ):
-        proxy.serve(port=8340)
+        server.serve(port=8340)
