@@ -14,14 +14,12 @@ Then point your client at:
     export ANTHROPIC_BASE_URL=http://127.0.0.1:8340
 """
 
-from __future__ import annotations
-
 import json
 import os
 import socket
 import sys
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Optional
 
 from tinkuy.gateway import Gateway, GatewayConfig
 from tinkuy.harness import extract_signals, strip_signals
@@ -57,7 +55,7 @@ def create_app(
     # Per-session gateways, keyed by session ID or a default
     gateways: dict[str, Gateway] = {}
 
-    def get_gateway(session_id: str | None) -> Gateway:
+    def get_gateway(session_id: Optional[str]) -> Gateway:
         key = session_id or "__default__"
         if key not in gateways:
             cfg = GatewayConfig(
@@ -76,9 +74,12 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # transport with no decompression — we proxy raw bytes
+        transport = httpx.AsyncHTTPTransport()
         app.state.client = httpx.AsyncClient(
             base_url=upstream,
             timeout=httpx.Timeout(300.0, connect=10.0),
+            transport=transport,
         )
         yield
         await app.state.client.aclose()
@@ -92,7 +93,9 @@ def create_app(
     @app.post("/v1/messages")
     async def messages(request: Request) -> Response:
         """Intercept /v1/messages — the main gateway path."""
+        from starlette.responses import StreamingResponse
         body = await request.json()
+        is_streaming = body.get("stream", False)
 
         # Extract session ID from header if provided
         session_id = request.headers.get("x-tinkuy-session")
@@ -121,7 +124,6 @@ def create_app(
             synth = turn_result.api_payload
         else:
             # No user content to process — pass through
-            # (shouldn't happen in normal flow, but be safe)
             synth = {"messages": request_messages}
             if "system" in body:
                 synth["system"] = body["system"]
@@ -140,38 +142,86 @@ def create_app(
             if val:
                 headers[key] = val
 
-        # Forward to upstream
         client: httpx.AsyncClient = request.app.state.client
-        upstream_resp = await client.post(
-            "/v1/messages",
-            json=upstream_body,
-            headers=headers,
-        )
 
-        # Parse upstream response
-        resp_data = upstream_resp.json()
-
-        # Extract response text
-        response_text = _extract_response_text(resp_data)
-
-        if response_text:
-            # Extract cooperative memory signals
-            signals = extract_signals(response_text)
-            clean_response = strip_signals(response_text)
-
-            # Ingest response into the gateway
-            gw.ingest_response(
-                content=clean_response,
-                signals=signals if signals else None,
+        if is_streaming:
+            # Streaming: proxy the SSE stream, collecting text for
+            # post-response ingestion
+            upstream_req = client.build_request(
+                "POST", "/v1/messages",
+                json=upstream_body, headers=headers,
+            )
+            upstream_resp = await client.send(
+                upstream_req, stream=True,
             )
 
-        # Return the upstream response unmodified to the client
-        return Response(
-            content=upstream_resp.content,
-            status_code=upstream_resp.status_code,
-            headers=dict(upstream_resp.headers),
-            media_type="application/json",
-        )
+            collected_text: list[str] = []
+
+            async def stream_and_collect():
+                async for chunk in upstream_resp.aiter_bytes():
+                    # Collect text blocks from SSE for ingestion
+                    _collect_sse_text(chunk, collected_text)
+                    yield chunk
+                await upstream_resp.aclose()
+
+                # Post-stream: ingest the collected response
+                full_text = "".join(collected_text)
+                if full_text:
+                    signals = extract_signals(full_text)
+                    clean = strip_signals(full_text)
+                    gw.ingest_response(
+                        content=clean,
+                        signals=signals if signals else None,
+                    )
+
+            # Strip content-encoding — httpx already decompressed
+            resp_headers = dict(upstream_resp.headers)
+            resp_headers.pop("content-encoding", None)
+            resp_headers.pop("content-length", None)
+
+            return StreamingResponse(
+                stream_and_collect(),
+                status_code=upstream_resp.status_code,
+                headers=resp_headers,
+                media_type="text/event-stream",
+            )
+        else:
+            # Non-streaming: standard request/response
+            upstream_resp = await client.post(
+                "/v1/messages",
+                json=upstream_body,
+                headers=headers,
+            )
+
+            # Handle error responses gracefully
+            resp_headers = dict(upstream_resp.headers)
+            resp_headers.pop("content-encoding", None)
+            resp_headers.pop("content-length", None)
+
+            if upstream_resp.status_code >= 400:
+                return Response(
+                    content=upstream_resp.content,
+                    status_code=upstream_resp.status_code,
+                    headers=resp_headers,
+                )
+
+            resp_data = upstream_resp.json()
+            response_text = _extract_response_text(resp_data)
+
+            if response_text:
+                signals = extract_signals(response_text)
+                clean_response = strip_signals(response_text)
+                gw.ingest_response(
+                    content=clean_response,
+                    signals=signals if signals else None,
+                )
+
+            return Response(
+                content=upstream_resp.content,
+                status_code=upstream_resp.status_code,
+                headers=resp_headers,
+                media_type="application/json",
+            )
 
     @app.get("/v1/tinkuy/status")
     async def status(request: Request) -> dict[str, Any]:
@@ -197,6 +247,30 @@ def create_app(
         return {"status": "ok", "service": "tinkuy"}
 
     return app
+
+
+def _collect_sse_text(chunk: bytes, collected: list[str]) -> None:
+    """Extract text content from SSE chunks for post-stream ingestion.
+
+    Anthropic SSE format sends content_block_delta events with text
+    deltas. We collect these to reconstruct the full response.
+    """
+    for line in chunk.decode("utf-8", errors="replace").split("\n"):
+        line = line.strip()
+        if not line.startswith("data: "):
+            continue
+        data = line[6:]
+        if data == "[DONE]":
+            continue
+        try:
+            event = json.loads(data)
+            event_type = event.get("type", "")
+            if event_type == "content_block_delta":
+                delta = event.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    collected.append(delta.get("text", ""))
+        except json.JSONDecodeError:
+            pass
 
 
 def _extract_user_content(
