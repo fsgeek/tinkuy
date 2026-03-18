@@ -15,10 +15,15 @@ from tinkuy.regions import RegionID
 
 
 class MockMessageStream:
-    def __init__(self, incoming: list[str | None]) -> None:
+    def __init__(self, incoming: list[str | None], session_id: str | None = None) -> None:
         self._incoming = iter(incoming)
         self.delivered: list[tuple[str, dict[str, object]]] = []
         self.statuses: list[str] = []
+        self._session_id = session_id
+
+    @property
+    def session_id(self) -> str | None:
+        return self._session_id
 
     def receive(self) -> str | None:
         return next(self._incoming, None)

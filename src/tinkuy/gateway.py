@@ -49,6 +49,7 @@ class GatewayConfig:
     """Configuration for a gateway instance."""
     context_limit: int = 200_000
     data_dir: str | None = None        # filesystem persistence root
+    session_id: str | None = None      # session identity (from adapter)
     enable_console: bool = False        # console status consumer
     enable_event_log: bool = True       # in-memory event log
 
@@ -78,13 +79,21 @@ class Gateway:
         self._live = LiveAdapter(self.orchestrator)
 
     def _setup_stores(self) -> None:
-        """Initialize page store and checkpoint store."""
+        """Initialize page store and checkpoint store.
+
+        Page store is workspace-scoped (shared across sessions).
+        Checkpoint store is session-scoped (keyed by session_id).
+        """
         if self.config.data_dir:
             root = Path(self.config.data_dir)
+            # Pages are shared — any session can recall any page
             self.page_store: PageStore = FilePageStore(root / "pages")
-            self.checkpoint_store: CheckpointStore = FileCheckpointStore(
-                root / "checkpoint.json"
-            )
+            # Checkpoints are per-session
+            if self.config.session_id:
+                ckpt_path = root / "sessions" / self.config.session_id / "checkpoint.json"
+            else:
+                ckpt_path = root / "checkpoint.json"
+            self.checkpoint_store: CheckpointStore = FileCheckpointStore(ckpt_path)
         else:
             self.page_store = MemoryPageStore()
             self.checkpoint_store = MemoryCheckpointStore()

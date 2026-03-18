@@ -136,6 +136,16 @@ class MessageStream(Protocol):
     receive input and deliver output.
     """
 
+    @property
+    def session_id(self) -> str | None:
+        """Return the session ID, or None if unknown.
+
+        The adapter is responsible for obtaining this — from an API
+        header, the Claude Code session index, or wherever. The
+        gateway uses it to key per-session checkpoints.
+        """
+        ...
+
     def receive(self) -> str | None:
         """Receive the next user message, or None to end the session."""
         ...
@@ -216,6 +226,11 @@ class SessionHarness:
 
     def start(self) -> None:
         """Initialize the gateway, optionally resuming or rehydrating."""
+        # Plumb session ID from frontend into gateway config
+        session_id = self.frontend.session_id
+        if session_id and not self.config.gateway_config.session_id:
+            self.config.gateway_config.session_id = session_id
+
         # Try to resume from checkpoint
         gw = Gateway.resume(self.config.gateway_config)
 
