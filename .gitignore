@@ -7,3 +7,4 @@ build/
 *.tmp
 *.bak
 .tinkuy-data/
+.serena/
