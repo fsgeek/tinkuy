@@ -2,7 +2,7 @@
 name = "tinkuy"
 version = "0.1.0"
 description = "Projective gateway for transformer memory hierarchy"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]

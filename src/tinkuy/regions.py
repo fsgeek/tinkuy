@@ -343,3 +343,51 @@ class Projection:
                 for rid, region in self.regions.items()
             },
         }
+
+    @classmethod
+    def from_snapshot(cls, data: dict[str, Any]) -> Projection:
+        """Rebuild a projection from snapshot data."""
+        projection = cls(turn=int(data.get("turn", 0)))
+        regions_data = data.get("regions", {})
+
+        for rid in RegionID:
+            region_data = regions_data.get(rid.name, {})
+            region = projection.region(rid)
+
+            for block_data in region_data.get("blocks", []):
+                access_data = block_data.get("access", {})
+                block = ContentBlock(
+                    handle=block_data["handle"],
+                    kind=ContentKind[block_data["kind"]],
+                    label=block_data["label"],
+                    # Snapshots do not include verbatim content.
+                    content="",
+                    status=ContentStatus[block_data["status"]],
+                    region=rid,
+                    size_tokens=int(block_data.get("size_tokens", 0)),
+                    access=AccessRecord(
+                        created_turn=int(access_data.get("created_turn", 0)),
+                        last_access_turn=int(
+                            access_data.get("last_access_turn", 0)
+                        ),
+                        access_count=int(access_data.get("access_count", 0)),
+                        fault_count=int(access_data.get("fault_count", 0)),
+                    ),
+                    metadata=dict(block_data.get("metadata", {})),
+                    tensor_handle=block_data.get("tensor_handle"),
+                )
+                region.blocks.append(block)
+
+            for nomination_data in region_data.get("nominations", []):
+                region.nominations.append(
+                    RemovalNomination(
+                        handle=nomination_data["handle"],
+                        source=nomination_data["source"],
+                        reason=nomination_data["reason"],
+                        tensor_provided=bool(
+                            nomination_data.get("tensor_provided", False)
+                        ),
+                    )
+                )
+
+        return projection
