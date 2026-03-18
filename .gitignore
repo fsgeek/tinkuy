@@ -6,3 +6,4 @@ build/
 .pytest_cache/
 *.tmp
 *.bak
+.tinkuy-data/
