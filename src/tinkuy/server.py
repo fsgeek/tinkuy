@@ -24,7 +24,8 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
-from tinkuy.gateway import Gateway, GatewayConfig
+from tinkuy.gateway import Gateway, GatewayConfig, TurnTelemetry
+from tinkuy.stream import BlockType, StreamBuffer
 
 log = logging.getLogger("tinkuy.server")
 
@@ -134,6 +135,7 @@ def create_app(
                 "POST", "/v1/messages",
                 content=upstream_bytes, headers=headers,
             )
+            t_start = time.monotonic()
             upstream_resp = await client.send(upstream_req, stream=True)
 
             log.info("-> upstream | status=%d (stream)", upstream_resp.status_code)
@@ -143,20 +145,37 @@ def create_app(
                     upstream_resp, upstream_body, upstream_bytes
                 )
 
-            collected_text: list[str] = []
-            collected_usage: dict[str, int] = {}
+            buffer = StreamBuffer()
+            t_first_byte: float | None = None
 
             async def stream_and_collect():
+                nonlocal t_first_byte
                 async for chunk in upstream_resp.aiter_bytes():
-                    _collect_sse_text(chunk, collected_text, collected_usage)
-                    yield chunk
+                    if t_first_byte is None:
+                        t_first_byte = time.monotonic()
+                    # StreamBuffer parses, reconstructs, re-serializes
+                    for out_chunk in buffer.feed(chunk):
+                        yield out_chunk
                 await upstream_resp.aclose()
 
-                # Post-stream: gateway ingests the response
-                full_text = "".join(collected_text)
-                if full_text:
-                    gw.ingest_raw_response(full_text)
-                _log_request_summary(collected_usage, len(full_text))
+                t_end = time.monotonic()
+
+                # Build telemetry from the reconstructed message
+                if buffer.complete:
+                    message = buffer.finish()
+                    telemetry = _build_telemetry(
+                        message,
+                        request_bytes=len(upstream_bytes),
+                        ttfb=(t_first_byte - t_start) if t_first_byte else None,
+                        duration=t_end - t_start,
+                    )
+                    # Gateway ingests the response text
+                    text = _extract_text_from_message(message)
+                    if text:
+                        gw.ingest_raw_response(text)
+                    # Gateway receives the telemetry
+                    gw.report_telemetry(telemetry)
+                    _log_request_summary_from_telemetry(telemetry)
 
             resp_headers = _strip_encoding_headers(upstream_resp)
             return StreamingResponse(
@@ -190,14 +209,11 @@ def create_app(
 
             resp_data = upstream_resp.json()
             gw.ingest_response_json(resp_data)
-            _log_request_summary(
-                resp_data.get("usage", {}),
-                sum(
-                    len(b.get("text", ""))
-                    for b in resp_data.get("content", [])
-                    if isinstance(b, dict) and b.get("type") == "text"
-                ),
-            )
+
+            # Build telemetry from non-streaming response
+            telemetry = _build_telemetry_from_json(resp_data)
+            gw.report_telemetry(telemetry)
+            _log_request_summary_from_telemetry(telemetry)
 
             return Response(
                 content=upstream_resp.content,
@@ -295,38 +311,69 @@ async def _handle_error(
     )
 
 
-def _collect_sse_text(
-    chunk: bytes,
-    collected: list[str],
-    usage: dict[str, int] | None = None,
-) -> None:
-    """Extract text content and usage from SSE chunks."""
-    for line in chunk.decode("utf-8", errors="replace").split("\n"):
-        line = line.strip()
-        if not line.startswith("data: "):
-            continue
-        data = line[6:]
-        if data == "[DONE]":
-            continue
-        try:
-            event = json.loads(data)
-            event_type = event.get("type", "")
-            if event_type == "content_block_delta":
-                delta = event.get("delta", {})
-                if delta.get("type") == "text_delta":
-                    collected.append(delta.get("text", ""))
-            elif usage is not None:
-                msg_usage = None
-                if event_type == "message_start":
-                    msg_usage = event.get("message", {}).get("usage")
-                elif event_type == "message_delta":
-                    msg_usage = event.get("usage")
-                if msg_usage:
-                    for k, v in msg_usage.items():
-                        if isinstance(v, int):
-                            usage[k] = usage.get(k, 0) + v
-        except json.JSONDecodeError:
-            pass
+def _extract_text_from_message(message: Any) -> str:
+    """Extract text content from a ReconstructedMessage."""
+    parts = []
+    for block in message.blocks:
+        if block.block_type == BlockType.TEXT and block.text:
+            parts.append(block.text)
+    return "\n".join(parts)
+
+
+def _build_telemetry(
+    message: Any,
+    request_bytes: int = 0,
+    ttfb: float | None = None,
+    duration: float | None = None,
+) -> TurnTelemetry:
+    """Build a TurnTelemetry from a ReconstructedMessage."""
+    usage = message.usage
+    tool_names = [
+        b.tool_name for b in message.blocks
+        if b.block_type == BlockType.TOOL_USE and b.tool_name
+    ]
+    return TurnTelemetry(
+        message_id=message.id,
+        model=message.model,
+        stop_reason=message.stop_reason,
+        input_tokens=usage.get("input_tokens", 0),
+        output_tokens=usage.get("output_tokens", 0),
+        cache_read_tokens=usage.get("cache_read_input_tokens", 0),
+        cache_create_tokens=usage.get("cache_creation_input_tokens", 0),
+        text_blocks=sum(1 for b in message.blocks if b.block_type == BlockType.TEXT),
+        thinking_blocks=sum(
+            1 for b in message.blocks
+            if b.block_type in (BlockType.THINKING, BlockType.REDACTED_THINKING)
+        ),
+        tool_use_blocks=sum(1 for b in message.blocks if b.block_type == BlockType.TOOL_USE),
+        tool_names=tool_names,
+        request_bytes=request_bytes,
+        ttfb=ttfb,
+        duration=duration,
+    )
+
+
+def _build_telemetry_from_json(resp_data: dict[str, Any]) -> TurnTelemetry:
+    """Build a TurnTelemetry from a non-streaming JSON response."""
+    usage = resp_data.get("usage", {})
+    content = resp_data.get("content", [])
+    tool_names = [
+        b.get("name", "") for b in content
+        if isinstance(b, dict) and b.get("type") == "tool_use"
+    ]
+    return TurnTelemetry(
+        message_id=resp_data.get("id", ""),
+        model=resp_data.get("model", ""),
+        stop_reason=resp_data.get("stop_reason"),
+        input_tokens=usage.get("input_tokens", 0),
+        output_tokens=usage.get("output_tokens", 0),
+        cache_read_tokens=usage.get("cache_read_input_tokens", 0),
+        cache_create_tokens=usage.get("cache_creation_input_tokens", 0),
+        text_blocks=sum(1 for b in content if isinstance(b, dict) and b.get("type") == "text"),
+        thinking_blocks=sum(1 for b in content if isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking")),
+        tool_use_blocks=sum(1 for b in content if isinstance(b, dict) and b.get("type") == "tool_use"),
+        tool_names=tool_names,
+    )
 
 
 def _dump_rejected_payload(body: dict[str, Any], status: int) -> None:
@@ -379,26 +426,28 @@ def _log_message_structure(body: dict[str, Any]) -> None:
     )
 
 
-def _log_request_summary(usage: dict[str, int], response_len: int) -> None:
-    """Log a one-line summary with cache utilization after each request."""
-    input_tok = usage.get("input_tokens", 0)
-    output_tok = usage.get("output_tokens", 0)
-    cache_read = usage.get("cache_read_input_tokens", 0)
-    cache_create = usage.get("cache_creation_input_tokens", 0)
-
-    cache_eligible = input_tok + cache_read + cache_create
-    cache_pct = (cache_read / cache_eligible * 100) if cache_eligible > 0 else 0.0
+def _log_request_summary_from_telemetry(t: TurnTelemetry) -> None:
+    """Log a one-line summary from telemetry. All numbers are tokens."""
+    total_in = t.total_input_tokens
+    cache_pct = t.cache_hit_rate * 100
 
     parts = [
-        f"ok {input_tok:,}in/{output_tok:,}out",
+        f"ok {t.input_tokens:,}+{t.cache_read_tokens:,}cache/{t.output_tokens:,}out",
+        f"({total_in:,} total in)",
         f"cache:{cache_pct:.0f}%",
     ]
-    if cache_create > 0:
-        parts.append(f"write:{cache_create:,}")
-    if cache_read > 0:
-        parts.append(f"read:{cache_read:,}")
-    if response_len > 0:
-        parts.append(f"resp:{response_len:,}ch")
+    if t.cache_create_tokens > 0:
+        parts.append(f"write:{t.cache_create_tokens:,}")
+    if t.stop_reason:
+        parts.append(f"stop:{t.stop_reason}")
+    if t.tool_names:
+        parts.append(f"tools:[{','.join(t.tool_names[:3])}]")
+    if t.ttfb is not None:
+        parts.append(f"ttfb:{t.ttfb:.1f}s")
+    if t.duration is not None:
+        parts.append(f"total:{t.duration:.1f}s")
+    if t.request_bytes > 0:
+        parts.append(f"wire:{t.request_bytes:,}B")
 
     log.info(" | ".join(parts))
 

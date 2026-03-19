@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -58,6 +59,53 @@ class GatewayConfig:
 
 
 @dataclass
+class TurnTelemetry:
+    """What the API told us about a turn. The research record.
+
+    Every field comes from the API response or wire-level observation.
+    Nothing is estimated or inferred — this is ground truth.
+    """
+    # Identity
+    message_id: str = ""
+    model: str = ""
+    turn: int = 0
+    timestamp: float = field(default_factory=time.time)
+
+    # Token counts (from API usage object)
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_create_tokens: int = 0
+
+    # Stop condition
+    stop_reason: str | None = None  # end_turn, max_tokens, tool_use
+
+    # Response structure
+    text_blocks: int = 0
+    thinking_blocks: int = 0
+    tool_use_blocks: int = 0
+    tool_names: list[str] = field(default_factory=list)
+
+    # Wire cost
+    request_bytes: int = 0
+
+    # Timing (seconds)
+    ttfb: float | None = None       # time to first byte
+    duration: float | None = None   # total request duration
+
+    @property
+    def total_input_tokens(self) -> int:
+        """Total logical input: processed + cache read + cache create."""
+        return self.input_tokens + self.cache_read_tokens + self.cache_create_tokens
+
+    @property
+    def cache_hit_rate(self) -> float:
+        """Fraction of logical input served from cache."""
+        total = self.total_input_tokens
+        return self.cache_read_tokens / total if total > 0 else 0.0
+
+
+@dataclass
 class TurnResult:
     """What the gateway returns to the harness after a turn."""
     api_payload: dict[str, Any]        # synthesized Anthropic API payload
@@ -80,6 +128,8 @@ class Gateway:
         self._setup_orchestrator()
         self._ingest = IngestAdapter(self.orchestrator)
         self._live = LiveAdapter(self.orchestrator)
+        self.telemetry: list[TurnTelemetry] = []
+        self._client_overhead_tokens: int | None = None
 
     def _setup_stores(self) -> None:
         """Initialize page store and checkpoint store.
@@ -329,6 +379,79 @@ class Gateway:
         """Ingest a complete Anthropic API response JSON."""
         text = _extract_response_text(response_data)
         return self.ingest_raw_response(text)
+
+    # --- Telemetry ---
+
+    def report_telemetry(self, telemetry: TurnTelemetry) -> None:
+        """Report API telemetry from the last turn.
+
+        This is the data pipeline — the server hands us ground-truth
+        numbers from the API, we use them to calibrate pressure and
+        build the research record.
+        """
+        telemetry.turn = self.turn
+        self.telemetry.append(telemetry)
+
+        # Calibrate pressure: the API knows the true context size.
+        # Our projection only counts what we ingested. The difference
+        # is the client overhead (system prompt, tools, etc.) which
+        # is roughly constant for a session.
+        #
+        # When api_total < projection_tokens, the projection has stale
+        # content from a prior session (resumed checkpoint). The API
+        # only saw what we actually sent — so api_total is the truth.
+        api_total = telemetry.total_input_tokens
+        projection_tokens = self.orchestrator.projection.total_tokens
+        if api_total > 0:
+            if api_total > projection_tokens:
+                overhead = api_total - projection_tokens
+            else:
+                # Stale projection — the API saw less than we think.
+                # Client overhead is at least api_total minus what a
+                # fresh projection would hold. Use api_total as floor.
+                overhead = 0
+                log.warning(
+                    "  telemetry | projection (%d tok) exceeds API total "
+                    "(%d tok) — stale checkpoint?",
+                    projection_tokens, api_total,
+                )
+
+            if self._client_overhead_tokens is None:
+                self._client_overhead_tokens = overhead
+                log.info(
+                    "  telemetry | client overhead calibrated: %d tokens "
+                    "(api=%d, projection=%d)",
+                    overhead, api_total, projection_tokens,
+                )
+            else:
+                self._client_overhead_tokens = int(
+                    0.3 * self._client_overhead_tokens + 0.7 * overhead
+                )
+
+        log.info(
+            "  telemetry | %s in=%d+%dcache out=%d stop=%s "
+            "blocks=%d/%d/%d overhead=%s",
+            telemetry.message_id[:12] if telemetry.message_id else "?",
+            telemetry.input_tokens,
+            telemetry.cache_read_tokens,
+            telemetry.output_tokens,
+            telemetry.stop_reason or "?",
+            telemetry.text_blocks,
+            telemetry.thinking_blocks,
+            telemetry.tool_use_blocks,
+            f"{self._client_overhead_tokens:,}"
+            if self._client_overhead_tokens is not None else "uncalibrated",
+        )
+
+    @property
+    def calibrated_total_tokens(self) -> int:
+        """Projection tokens + estimated client overhead.
+
+        This is our best estimate of what the API will actually see.
+        Use this for pressure decisions, not projection.total_tokens.
+        """
+        base = self.orchestrator.projection.total_tokens
+        return base + (self._client_overhead_tokens or 0)
 
     # --- Convenience ---
 
