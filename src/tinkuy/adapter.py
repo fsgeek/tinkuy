@@ -416,7 +416,10 @@ class LiveAdapter:
         ]
 
         # Enforce alternation
-        return self._enforce_alternation(raw_messages)
+        messages = self._enforce_alternation(raw_messages)
+
+        # Finalize: place cache breakpoint and strip internal annotations
+        return self._finalize_messages(messages)
 
     def _block_to_message(
         self,
@@ -496,17 +499,61 @@ class LiveAdapter:
                     prev["content"] = prev["content"] + "\n" + content
                 else:
                     prev["content"] = str(prev["content"]) + "\n" + content
+                # Preserve cache hint: if either message is durable, keep it
+                if "_cache_control" in msg and "_cache_control" not in prev:
+                    prev["_cache_control"] = msg["_cache_control"]
             else:
                 # Need alternation — insert padding if needed
                 if result and role == "assistant" and result[-1]["role"] == "assistant":
                     result.append({"role": "user", "content": "[continued]"})
                 elif result and role == "user" and result[-1]["role"] == "user":
                     result.append({"role": "assistant", "content": "[continued]"})
-                result.append({"role": role, "content": content})
+                # Preserve metadata through alternation
+                clean = {"role": role, "content": content}
+                for k in msg:
+                    if k.startswith("_"):
+                        clean[k] = msg[k]
+                result.append(clean)
 
         # Must start with user
         if result and result[0]["role"] != "user":
             result.insert(0, {"role": "user", "content": "[conversation start]"})
+
+        return result
+
+    def _finalize_messages(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Place cache breakpoint on last durable message, strip annotations.
+
+        Anthropic caches from the start of the request up to each
+        cache_control breakpoint. We place one on the last message
+        that carries _cache_control — the boundary between stable
+        (durable) and volatile (ephemeral/current) conversation.
+
+        cache_control goes on a content block, not the message dict,
+        so we convert the message's string content to a content array.
+        """
+        # Find the last message with a cache hint
+        last_cached_idx = None
+        for i, msg in enumerate(messages):
+            if "_cache_control" in msg:
+                last_cached_idx = i
+
+        result: list[dict[str, Any]] = []
+        for i, msg in enumerate(messages):
+            clean = {k: v for k, v in msg.items() if not k.startswith("_")}
+
+            if i == last_cached_idx:
+                # Promote to content array with cache_control on last block
+                text = clean["content"]
+                clean["content"] = [{
+                    "type": "text",
+                    "text": text,
+                    "cache_control": {"type": "ephemeral"},
+                }]
+
+            result.append(clean)
 
         return result
 
