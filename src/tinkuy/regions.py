@@ -58,6 +58,8 @@ class AccessRecord:
     last_access_turn: int = 0
     access_count: int = 0
     fault_count: int = 0       # times recalled after eviction
+    created_at: float = field(default_factory=time.time)
+    evicted_at: float | None = None
 
     def touch(self, turn: int) -> None:
         """Record an access."""
@@ -278,6 +280,7 @@ class Projection:
                 continue
             block.status = ContentStatus.AVAILABLE
             block.tensor_handle = tensor.handle
+            block.access.evicted_at = time.time()
             # Tensor goes into R2 (durable)
             self.regions[RegionID.DURABLE].add(tensor)
             return True
@@ -324,6 +327,8 @@ class Projection:
                                 "last_access_turn": b.access.last_access_turn,
                                 "access_count": b.access.access_count,
                                 "fault_count": b.access.fault_count,
+                                "created_at": b.access.created_at,
+                                "evicted_at": b.access.evicted_at,
                             },
                             "tensor_handle": b.tensor_handle,
                             "metadata": b.metadata,
@@ -372,6 +377,10 @@ class Projection:
                         ),
                         access_count=int(access_data.get("access_count", 0)),
                         fault_count=int(access_data.get("fault_count", 0)),
+                        created_at=float(
+                            access_data.get("created_at", time.time())
+                        ),
+                        evicted_at=access_data.get("evicted_at"),
                     ),
                     metadata=dict(block_data.get("metadata", {})),
                     tensor_handle=block_data.get("tensor_handle"),

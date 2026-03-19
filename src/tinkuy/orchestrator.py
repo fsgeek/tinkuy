@@ -442,6 +442,7 @@ class Orchestrator:
                         EventKind.BLOCK_RECALLED,
                         handle=signal.handle,
                         fault_count=block.access.fault_count,
+                        evicted_at=block.access.evicted_at,
                     )
                     break
 
