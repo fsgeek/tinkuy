@@ -103,6 +103,18 @@ def create_app(
         lifespan=lifespan,
     )
 
+    @app.exception_handler(404)
+    async def not_found_handler(request: Request, exc: Any):
+        log.warning(
+            "!! 404 | %s %s (unhandled route)",
+            request.method, request.url.path,
+        )
+        return Response(
+            content=json.dumps({"error": "not found", "path": request.url.path}),
+            status_code=404,
+            media_type="application/json",
+        )
+
     @app.post("/v1/messages")
     async def messages(request: Request) -> Response:
         """The gateway path. No exceptions. No fallback. No bypass."""
@@ -169,10 +181,9 @@ def create_app(
                         ttfb=(t_first_byte - t_start) if t_first_byte else None,
                         duration=t_end - t_start,
                     )
-                    # Gateway ingests the response text
-                    text = _extract_text_from_message(message)
-                    if text:
-                        gw.ingest_raw_response(text)
+                    # Gateway ingests the response content
+                    text, content_blocks = _extract_response_content(message)
+                    gw.ingest_raw_response(text, content_blocks=content_blocks)
                     # Gateway receives the telemetry
                     gw.report_telemetry(telemetry)
                     _log_request_summary_from_telemetry(telemetry)
@@ -311,13 +322,28 @@ async def _handle_error(
     )
 
 
-def _extract_text_from_message(message: Any) -> str:
-    """Extract text content from a ReconstructedMessage."""
-    parts = []
+def _extract_response_content(
+    message: Any,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Extract text and full content blocks from a ReconstructedMessage.
+
+    Returns (text, content_blocks) where text is for scoring/display
+    and content_blocks is the full Anthropic content array for storage.
+    """
+    text_parts: list[str] = []
+    content_blocks: list[dict[str, Any]] = []
     for block in message.blocks:
         if block.block_type == BlockType.TEXT and block.text:
-            parts.append(block.text)
-    return "\n".join(parts)
+            text_parts.append(block.text)
+            content_blocks.append({"type": "text", "text": block.text})
+        elif block.block_type == BlockType.TOOL_USE:
+            content_blocks.append({
+                "type": "tool_use",
+                "id": block.tool_id,
+                "name": block.tool_name,
+                "input": block.input_parsed or {},
+            })
+    return "\n".join(text_parts), content_blocks
 
 
 def _build_telemetry(

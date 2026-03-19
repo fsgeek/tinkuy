@@ -384,10 +384,14 @@ class LiveAdapter:
                     "type": "text",
                     "text": block.content,
                 }
-                # Cache control: R0 and R1 are stable, mark ephemeral
-                # so the API caches them across turns
-                part["cache_control"] = {"type": "ephemeral"}
                 parts.append(part)
+
+        # Place one cache breakpoint on the last system block.
+        # The API allows at most 4 breakpoints — spending one here
+        # caches the entire system prompt prefix, leaving budget
+        # for the durable message boundary in _finalize_messages.
+        if parts:
+            parts[-1]["cache_control"] = {"type": "ephemeral"}
 
         return parts
 
@@ -453,13 +457,19 @@ class LiveAdapter:
         # Handle evicted content
         if block.status == ContentStatus.AVAILABLE:
             # Content was evicted — emit tensor marker
-            content = (
+            content: str | list[dict[str, Any]] = (
                 f"[tensor:{block.handle[:8]} — "
                 f"{block.label} "
                 f"({block.size_tokens} tokens)]"
             )
         else:
-            content = block.content
+            # Use full content blocks (text + tool_use) if available,
+            # otherwise fall back to plain text string
+            stored_blocks = block.metadata.get("content_blocks")
+            if stored_blocks:
+                content = stored_blocks
+            else:
+                content = block.content
 
         msg: dict[str, Any] = {
             "role": role,

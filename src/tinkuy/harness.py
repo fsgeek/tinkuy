@@ -23,9 +23,12 @@ client opaquely. The gateway never touches credentials.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol
+
+log = logging.getLogger("tinkuy.harness")
 
 from tinkuy.gateway import Gateway, GatewayConfig, TurnResult
 from tinkuy.orchestrator import TurnRecord
@@ -234,13 +237,18 @@ class SessionHarness:
         # Try to resume from checkpoint
         gw = Gateway.resume(self.config.gateway_config)
 
-        if gw is None:
+        if gw is not None:
+            log.info("session resumed from checkpoint (turn %d)",
+                     gw.orchestrator.projection.turn)
+        else:
             # Fresh start
             gw = Gateway(self.config.gateway_config)
+            log.info("session started fresh")
 
             # Rehydrate if source provided
             if self.config.rehydrate_source:
                 gw.rehydrate(self.config.rehydrate_source)
+                log.info("rehydrated from source")
 
         self._gateway = gw
 

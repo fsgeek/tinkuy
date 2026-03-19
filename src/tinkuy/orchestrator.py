@@ -21,12 +21,15 @@ Event flow:
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any
 
 from tinkuy.events import Event, EventBus, EventKind
+
+log = logging.getLogger("tinkuy.orchestrator")
 from tinkuy.pressure import (
     EvictionAction,
     EvictionDecision,
@@ -212,6 +215,7 @@ class Orchestrator:
         content: str,
         label: str = "assistant response",
         signals: list[ResponseSignal] | None = None,
+        content_blocks: list[dict] | None = None,
     ) -> TurnRecord:
         """Ingest an API response into the projection.
 
@@ -228,6 +232,7 @@ class Orchestrator:
             kind=ContentKind.CONVERSATION,
             label=label,
             region=RegionID.EPHEMERAL,
+            content_blocks=content_blocks,
         )
         record.response_handle = block.handle
         self._emit(
@@ -259,6 +264,11 @@ class Orchestrator:
         """Write a projection checkpoint if a store is configured."""
         if self._checkpoint_store is not None:
             self._checkpoint_store.save(self.projection.snapshot())
+            log.info(
+                "checkpoint written | turn=%d entries=%d",
+                self.projection.turn,
+                len(self.projection.entries),
+            )
 
     def _persist_page(self, handle: str, content: str) -> None:
         """Eagerly persist a verbatim original to the page store."""

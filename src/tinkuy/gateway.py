@@ -191,7 +191,13 @@ class Gateway:
             event_bus=gw.bus,
         )
         if restored is None:
+            log.info("no checkpoint found — fresh start")
             return None
+        log.info(
+            "resumed from checkpoint: turn=%d, %d entries",
+            restored.projection.turn,
+            len(restored.projection.entries),
+        )
         gw.orchestrator = restored
         gw._ingest = IngestAdapter(gw.orchestrator)
         gw._live = LiveAdapter(gw.orchestrator)
@@ -279,6 +285,7 @@ class Gateway:
         self,
         content: str,
         signals: list[dict[str, Any]] | None = None,
+        content_blocks: list[dict[str, Any]] | None = None,
     ) -> TurnRecord:
         """Ingest an API response after the harness calls the API.
 
@@ -295,6 +302,7 @@ class Gateway:
             content=content,
             label="assistant",
             signals=parsed_signals,
+            content_blocks=content_blocks,
         )
 
         # Mark idle after response ingestion — this is a cache boundary
@@ -357,28 +365,31 @@ class Gateway:
 
         return upstream
 
-    def ingest_raw_response(self, text: str) -> TurnRecord | None:
-        """Ingest raw assistant response text.
+    def ingest_raw_response(
+        self, text: str, content_blocks: list[dict[str, Any]] | None = None,
+    ) -> TurnRecord | None:
+        """Ingest raw assistant response text and structured content.
 
         Extracts cooperative memory signals, strips them, and feeds
-        the clean text into the orchestrator. The HTTP layer collects
-        text from the SSE stream and hands it here. It never parses
-        message content.
+        the clean text into the orchestrator. content_blocks preserves
+        the full Anthropic content array (text + tool_use) so the
+        projection can synthesize faithful messages on the next turn.
         """
-        if not text:
+        if not text and not content_blocks:
             return None
         from tinkuy.harness import extract_signals, strip_signals
-        signals = extract_signals(text)
-        clean = strip_signals(text)
+        signals = extract_signals(text) if text else []
+        clean = strip_signals(text) if text else ""
         return self.ingest_response(
             content=clean,
             signals=signals if signals else None,
+            content_blocks=content_blocks,
         )
 
     def ingest_response_json(self, response_data: dict[str, Any]) -> TurnRecord | None:
         """Ingest a complete Anthropic API response JSON."""
-        text = _extract_response_text(response_data)
-        return self.ingest_raw_response(text)
+        text, content_blocks = _extract_response_content_from_json(response_data)
+        return self.ingest_raw_response(text, content_blocks=content_blocks)
 
     # --- Telemetry ---
 
@@ -592,11 +603,25 @@ def _merge_system(
     return client_parts + new_parts
 
 
-def _extract_response_text(resp_data: dict[str, Any]) -> str:
-    """Extract text content from an Anthropic API response."""
+def _extract_response_content_from_json(
+    resp_data: dict[str, Any],
+) -> tuple[str, list[dict[str, Any]]]:
+    """Extract text and full content blocks from an Anthropic API response."""
     content = resp_data.get("content", [])
-    parts = []
+    text_parts: list[str] = []
+    content_blocks: list[dict[str, Any]] = []
     for block in content:
-        if isinstance(block, dict) and block.get("type") == "text":
-            parts.append(block.get("text", ""))
-    return "\n".join(parts)
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type", "")
+        if block_type == "text":
+            text_parts.append(block.get("text", ""))
+            content_blocks.append({"type": "text", "text": block.get("text", "")})
+        elif block_type == "tool_use":
+            content_blocks.append({
+                "type": "tool_use",
+                "id": block.get("id", ""),
+                "name": block.get("name", ""),
+                "input": block.get("input", {}),
+            })
+    return "\n".join(text_parts), content_blocks
