@@ -26,9 +26,9 @@ from typing import Any, Callable
 
 log = logging.getLogger("tinkuy.gateway")
 
-from tinkuy.adapter import IngestAdapter, LiveAdapter
-from tinkuy.events import ConsoleStatusConsumer, EventBus, EventLog
-from tinkuy.orchestrator import (
+from tinkuy.core.adapter import IngestAdapter
+from tinkuy.core.events import ConsoleStatusConsumer, EventBus, EventLog
+from tinkuy.core.orchestrator import (
     EventType,
     InboundEvent,
     Orchestrator,
@@ -36,9 +36,9 @@ from tinkuy.orchestrator import (
     ResponseSignalType,
     TurnRecord,
 )
-from tinkuy.pressure import PressureZone
-from tinkuy.regions import ContentKind, Projection, RegionID
-from tinkuy.store import (
+from tinkuy.core.pressure import PressureZone
+from tinkuy.core.regions import ContentKind, Projection, RegionID
+from tinkuy.core.store import (
     CheckpointStore,
     FileCheckpointStore,
     FilePageStore,
@@ -46,6 +46,7 @@ from tinkuy.store import (
     MemoryPageStore,
     PageStore,
 )
+from tinkuy.formats.anthropic import LiveAdapter
 
 
 @dataclass
@@ -377,7 +378,7 @@ class Gateway:
         """
         if not text and not content_blocks:
             return None
-        from tinkuy.harness import extract_signals, strip_signals
+        from tinkuy.gateway.harness import extract_signals, strip_signals
         signals = extract_signals(text) if text else []
         clean = strip_signals(text) if text else ""
         return self.ingest_response(
