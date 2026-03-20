@@ -85,7 +85,9 @@ def test_extract_response_text_reads_anthropic_text_blocks():
         ],
     }
 
-    assert gw_mod._extract_response_text(resp_data) == "line 1\nline 2"
+    text, blocks = gw_mod._extract_response_content_from_json(resp_data)
+    assert text == "line 1\nline 2"
+    assert len(blocks) == 3  # 2 text + 1 tool_use
 
 
 def test_create_app_returns_fastapi_with_expected_routes_and_health():

@@ -192,6 +192,38 @@ def parse_raw_messages(
     ]
 
 
+# Allowed keys per content block type for the Anthropic API.
+# Everything else (citations, parsed_output, etc.) must be stripped.
+_ALLOWED_BLOCK_KEYS: dict[str, set[str]] = {
+    "text": {"type", "text", "cache_control"},
+    "tool_use": {"type", "id", "name", "input", "cache_control"},
+    "tool_result": {"type", "tool_use_id", "content", "is_error", "cache_control"},
+    "thinking": {"type", "thinking", "signature", "cache_control"},
+    "image": {"type", "source", "cache_control"},
+}
+
+
+def _sanitize_content_block(block: dict[str, Any]) -> dict[str, Any]:
+    """Strip fields the Anthropic API won't accept on re-submission."""
+    if not isinstance(block, dict):
+        return block
+    block_type = block.get("type", "")
+    allowed = _ALLOWED_BLOCK_KEYS.get(block_type)
+    if allowed is None:
+        # Unknown block type — pass through as-is
+        return block
+    return {k: v for k, v in block.items() if k in allowed}
+
+
+def _has_content(content: str | list[dict[str, Any]]) -> bool:
+    """Check if a message content field is non-empty."""
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        return len(content) > 0
+    return bool(content)
+
+
 def _extract_text_from_blocks(blocks: list[dict[str, Any]]) -> str:
     """Extract text content from an Anthropic content block array."""
     parts = []
@@ -416,7 +448,7 @@ class LiveAdapter:
         # Filter out empty content before enforcing alternation
         raw_messages = [
             m for m in raw_messages
-            if m.get("content", "").strip()
+            if _has_content(m.get("content", ""))
         ]
 
         # Enforce alternation
@@ -554,14 +586,23 @@ class LiveAdapter:
         for i, msg in enumerate(messages):
             clean = {k: v for k, v in msg.items() if not k.startswith("_")}
 
+            # Sanitize content blocks — strip fields the API won't accept
+            if isinstance(clean.get("content"), list):
+                clean["content"] = [
+                    _sanitize_content_block(b) for b in clean["content"]
+                ]
+
             if i == last_cached_idx:
                 # Promote to content array with cache_control on last block
-                text = clean["content"]
-                clean["content"] = [{
-                    "type": "text",
-                    "text": text,
-                    "cache_control": {"type": "ephemeral"},
-                }]
+                content = clean["content"]
+                if isinstance(content, str):
+                    clean["content"] = [{
+                        "type": "text",
+                        "text": content,
+                        "cache_control": {"type": "ephemeral"},
+                    }]
+                elif isinstance(content, list) and content:
+                    content[-1]["cache_control"] = {"type": "ephemeral"}
 
             result.append(clean)
 
@@ -570,23 +611,116 @@ class LiveAdapter:
     def synthesize_page_table(self) -> str:
         """Synthesize the page table as text for system prompt injection.
 
-        This goes into R1 so the model can see what memory is available.
+        Uses episodic coalescing: consecutive present blocks are grouped
+        into episode summaries. Individual entries are preserved only for
+        blocks that are evicted/available (faultable) or have non-zero
+        fault counts (hot). Recent blocks (age <= 2 turns) also get
+        individual entries since the model may need fine-grained access.
+
+        This is the "indirect mapping table" — the model sees episodes,
+        not individual pages, unless a page needs individual attention.
         """
         entries = self.orchestrator.page_table()
         if not entries:
             return ""
 
-        lines = ["<yuyay-page-table>"]
+        current_turn = self.orchestrator.turn
+
+        # Partition: entries that need individual listing vs coalescing
+        individual: list[dict[str, Any]] = []
+        coalescable: list[dict[str, Any]] = []
+
         for e in entries:
+            if (e["status"] != "present"
+                    or e["fault_count"] > 0
+                    or e["age_turns"] <= 2):
+                individual.append(e)
+            else:
+                coalescable.append(e)
+
+        # Group coalescable entries into episodes by turn proximity
+        episodes = _coalesce_episodes(coalescable, current_turn)
+
+        lines = ["<yuyay-page-table>"]
+
+        # Episode summaries (older, stable content)
+        for ep in episodes:
+            lines.append(
+                f'  <episode turns="{ep["turn_range"]}" '
+                f'blocks="{ep["block_count"]}" '
+                f'tokens="{ep["total_tokens"]}" '
+                f'kinds="{ep["kinds"]}"/>'
+            )
+
+        # Individual entries (recent, evicted, or hot)
+        for e in individual:
             lines.append(
                 f'  <entry handle="{e["handle"]}" '
                 f'kind="{e["kind"]}" '
                 f'status="{e["status"]}" '
-                f'region="{e["region"]}" '
                 f'size_tokens="{e["size_tokens"]}" '
                 f'faults="{e["fault_count"]}" '
                 f'age_turns="{e["age_turns"]}" '
                 f'label="{e["label"]}"/>'
             )
+
         lines.append("</yuyay-page-table>")
         return "\n".join(lines)
+
+
+def _coalesce_episodes(
+    entries: list[dict[str, Any]],
+    current_turn: int,
+) -> list[dict[str, Any]]:
+    """Group entries into temporal episodes.
+
+    Consecutive entries (by created turn) within 3 turns of each other
+    are merged into one episode. This is the simplest coalescing
+    strategy — temporal proximity only, no topic analysis.
+    """
+    if not entries:
+        return []
+
+    # Sort by age descending (oldest first)
+    sorted_entries = sorted(entries, key=lambda e: -e["age_turns"])
+
+    episodes: list[dict[str, Any]] = []
+    current_ep: list[dict[str, Any]] = [sorted_entries[0]]
+
+    for entry in sorted_entries[1:]:
+        prev = current_ep[-1]
+        # Merge if within 3 turns of the previous entry
+        if abs(entry["age_turns"] - prev["age_turns"]) <= 3:
+            current_ep.append(entry)
+        else:
+            episodes.append(_summarize_episode(current_ep, current_turn))
+            current_ep = [entry]
+
+    if current_ep:
+        episodes.append(_summarize_episode(current_ep, current_turn))
+
+    return episodes
+
+
+def _summarize_episode(
+    entries: list[dict[str, Any]],
+    current_turn: int,
+) -> dict[str, Any]:
+    """Produce a summary for a group of entries."""
+    ages = [e["age_turns"] for e in entries]
+    oldest = max(ages)
+    newest = min(ages)
+
+    if oldest == newest:
+        turn_range = f"{current_turn - oldest}"
+    else:
+        turn_range = f"{current_turn - oldest}-{current_turn - newest}"
+
+    kinds = set(e["kind"] for e in entries)
+
+    return {
+        "turn_range": turn_range,
+        "block_count": len(entries),
+        "total_tokens": sum(e["size_tokens"] for e in entries),
+        "kinds": "+".join(sorted(kinds)),
+    }

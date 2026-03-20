@@ -267,7 +267,9 @@ def test_live_synthesize_messages_uses_system_from_r0_r1_and_valid_alternation()
 
     assert "system" in payload
     assert [part["text"] for part in payload["system"]] == ["tool schema", "system policy"]
-    assert all(part["cache_control"] == {"type": "ephemeral"} for part in payload["system"])
+    # Cache breakpoint goes on the last system part only (budget conservation)
+    assert payload["system"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert "cache_control" not in payload["system"][0]
 
     _assert_strict_alternation(payload["messages"])
 
@@ -353,13 +355,14 @@ def test_live_synthesize_page_table_output_format():
 
     assert table.startswith("<yuyay-page-table>\n")
     assert table.endswith("\n</yuyay-page-table>")
+    # Durable tensor has faults > 0, so it gets an individual entry
     assert f'handle="{durable.handle}"' in table
     assert 'kind="tensor"' in table
-    assert f'handle="{ephemeral.handle}"' in table
-    assert 'kind="tool_result"' in table
     assert 'status="present"' in table
-    assert f'region="{RegionID.DURABLE.value}"' in table
-    assert f'region="{RegionID.EPHEMERAL.value}"' in table
+    # Ephemeral block is coalescable (present, no faults, age > 2)
+    # so it appears in an episode summary, not individually
+    assert "episode" in table
+    assert 'kinds="tool_result"' in table
 
 
 def test_full_cycle_ingest_then_synthesize_messages():

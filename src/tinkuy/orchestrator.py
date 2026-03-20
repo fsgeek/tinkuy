@@ -265,9 +265,9 @@ class Orchestrator:
         if self._checkpoint_store is not None:
             self._checkpoint_store.save(self.projection.snapshot())
             log.info(
-                "checkpoint written | turn=%d entries=%d",
+                "checkpoint written | turn=%d tokens=%d",
                 self.projection.turn,
-                len(self.projection.entries),
+                self.projection.total_tokens,
             )
 
     def _persist_page(self, handle: str, content: str) -> None:

@@ -194,9 +194,9 @@ class Gateway:
             log.info("no checkpoint found — fresh start")
             return None
         log.info(
-            "resumed from checkpoint: turn=%d, %d entries",
+            "resumed from checkpoint: turn=%d, tokens=%d",
             restored.projection.turn,
-            len(restored.projection.entries),
+            restored.projection.total_tokens,
         )
         gw.orchestrator = restored
         gw._ingest = IngestAdapter(gw.orchestrator)
