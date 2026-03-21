@@ -336,6 +336,215 @@ def counterfactual_drift(*, n_facts: int = 5, n_padding_per_fact: int = 8) -> Ta
 
 
 # ---------------------------------------------------------------------------
+# Coherence Retention — can the model trace its own reasoning chains?
+# ---------------------------------------------------------------------------
+
+def coherence_retention(*, n_decisions: int = 4, n_padding_per_decision: int = 6) -> Task:
+    """Seed decisions with explicit rationales, then probe chain traversal.
+
+    Measures Coherence Retention (CR): the model's ability to reconstruct
+    the reasoning chain behind its own decisions. CR decay over
+    conversational distance is the provenance loss signal.
+
+    Unlike FR (factual retention), CR tests whether the model preserves
+    the *argument*, not just the *conclusion*. A model with high FR and
+    low CR knows what was decided but not why — compaction by another name.
+
+    Structure:
+      - Seed decision D1 with explicit rationale (multiple premises)
+      - Pad with diverse filler to push D1 back
+      - Seed decision D2, which explicitly depends on D1
+      - Pad with diverse filler
+      - ... build a chain of dependent decisions ...
+      - Probe each link: "why did we decide X?"
+      - Probe cross-links: "what was the original reason behind X?"
+        (requires tracing D3 → D2 → D1)
+
+    Scoring is richer than FR. Each probe has:
+      - direct_parent: did the model cite the immediate dependency?
+      - root_cause: did it trace back to the original premise?
+      - confabulation: did it invent a plausible but wrong rationale?
+
+    The CR profile is CR(chain_depth, conversational_distance).
+    """
+    # A decision chain where each decision depends on prior ones.
+    # Each entry: (decision, rationale, parent_indices)
+    # parent_indices refers to earlier decisions this one depends on.
+    decision_chain = [
+        (
+            "We'll use PostgreSQL as our primary datastore",
+            "Our access pattern analysis shows 90% reads with complex joins across "
+            "3 normalized tables, and the team has 3 engineers with deep Postgres "
+            "expertise versus zero with NoSQL experience. The read-heavy join pattern "
+            "rules out document stores, and the team skill gap would add 4 months "
+            "to any alternative.",
+            [],  # root decision — no parents
+        ),
+        (
+            "We'll use pgvector for embedding storage rather than a separate vector database",
+            "Since we already committed to PostgreSQL for the primary datastore, "
+            "adding pgvector keeps our operational footprint to one database system. "
+            "A separate vector DB like Pinecone would mean a second connection pool, "
+            "a second backup strategy, and a second failure domain. The embedding "
+            "workload is moderate — under 10M vectors — well within pgvector's range.",
+            [0],  # depends on D0 (Postgres choice)
+        ),
+        (
+            "We'll deploy on a single 64-core machine rather than a Kubernetes cluster",
+            "Our Postgres choice constrains deployment: connection pooling with "
+            "pgvector extensions works best with local Unix sockets. The embedding "
+            "workload fits in memory on a 64-core with 256GB RAM. Kubernetes would "
+            "add orchestration complexity for a workload that doesn't need horizontal "
+            "scaling — our 10M vector ceiling means vertical scaling is sufficient "
+            "for the next 18 months.",
+            [0, 1],  # depends on D0 (Postgres) and D1 (pgvector)
+        ),
+        (
+            "We'll use synchronous replication with a hot standby rather than async",
+            "The single-machine deployment means our failure domain is one box. "
+            "Synchronous replication to a hot standby gives us RPO=0 at the cost of "
+            "~2ms write latency. Since our access pattern is 90% reads, the write "
+            "penalty is acceptable. Async replication would risk losing the last "
+            "few embedding writes on failover, which would silently corrupt similarity "
+            "search results.",
+            [0, 2],  # depends on D0 (access patterns) and D2 (single machine)
+        ),
+        (
+            "We'll batch embedding updates nightly rather than computing them inline",
+            "Synchronous replication adds 2ms per write. Embedding computation adds "
+            "~50ms per record via the API. Inline updates during peak hours would "
+            "compound these latencies. Nightly batches keep write latency at 2ms "
+            "during the day and absorb the 50ms embedding cost during the low-traffic "
+            "window. This also means our pgvector indexes only rebuild once daily, "
+            "not continuously.",
+            [1, 3],  # depends on D1 (pgvector) and D3 (sync replication)
+        ),
+        (
+            "We'll implement a read-through cache using Redis for embedding lookups",
+            "The nightly batch means embeddings can be up to 24 hours stale. For "
+            "the 90% read workload, most queries hit the same popular items. A "
+            "Redis read-through cache absorbs repeated embedding lookups without "
+            "touching pgvector, reducing p99 query latency from 15ms to 2ms for "
+            "cached items. Cache invalidation is simple: nightly batch completion "
+            "triggers a full cache flush.",
+            [0, 4],  # depends on D0 (read-heavy pattern) and D4 (nightly batch)
+        ),
+    ][:n_decisions]
+
+    topics = [
+        "the thermodynamics of black hole information paradox",
+        "how ant colonies solve optimization problems without central control",
+        "the history of zero and its journey from India to Europe",
+        "how glacier movement shapes mountain valleys",
+        "the economics of prediction markets versus polling",
+        "how ribosomes translate mRNA into proteins",
+        "the engineering of noise-canceling headphones",
+        "how gerrymandering algorithms exploit graph partitioning",
+        "the chemistry of sourdough fermentation",
+        "how tide-predicting machines worked before computers",
+        "the physics of why cats always land on their feet",
+        "how central banks use open market operations",
+        "the biology of tardigrade cryptobiosis",
+        "the mathematics of perspective in Renaissance painting",
+        "how undersea fiber optic cables are laid and repaired",
+        "the psychology of the bystander effect",
+        "how metamaterials bend light in impossible directions",
+        "the ecology of keystone species removal cascades",
+        "how proof assistants verify mathematical theorems",
+        "the history of the Antikythera mechanism",
+        "the fluid dynamics of bird formation flying",
+        "how mesh networks route around failures",
+        "the chemistry of why leaves change color in autumn",
+        "the game theory of evolutionary stable strategies",
+        "how interferometers detect gravitational waves",
+        "the engineering of earthquake early warning systems",
+        "how the gut microbiome influences brain chemistry",
+        "the mathematics of gerrymandering detection",
+        "the physics of why spinning tops stay upright",
+        "how attribution models work in digital advertising",
+        "the biology of how electric eels generate voltage",
+        "the history of the Greenwich prime meridian decision",
+        "how type systems prevent bugs at compile time",
+        "the ecology of deep ocean chemosynthetic ecosystems",
+        "the psychology of the Dunning-Kruger effect",
+        "how quantum tunneling enables flash memory",
+    ]
+
+    messages: list[str] = []
+
+    # Seed decisions with explicit rationales, padding between them
+    for i, (decision, rationale, parents) in enumerate(decision_chain):
+        # Build the dependency context
+        if parents:
+            parent_refs = ", ".join(
+                f"decision #{p+1} ({decision_chain[p][0][:50]}...)"
+                for p in parents
+            )
+            seed = (
+                f"Based on our earlier decisions — specifically {parent_refs} — "
+                f"I propose decision #{i+1}: {decision}. "
+                f"The reasoning is: {rationale} "
+                f"Please confirm you understand this decision and how it connects "
+                f"to our prior decisions."
+            )
+        else:
+            seed = (
+                f"Let's establish our first architectural decision. "
+                f"Decision #{i+1}: {decision}. "
+                f"The reasoning is: {rationale} "
+                f"Please confirm you understand this decision and its rationale."
+            )
+        messages.append(seed)
+
+        # Pad with diverse filler
+        for j in range(n_padding_per_decision):
+            topic_idx = (i * n_padding_per_decision + j) % len(topics)
+            messages.append(f"Explain {topics[topic_idx]}.")
+
+    # --- Probes ---
+    # Direct parent probes: "why did we decide X?" — tests one hop back
+    for i, (decision, rationale, parents) in enumerate(decision_chain):
+        if parents:
+            messages.append(
+                f"I need to document our architectural decisions. "
+                f"For decision #{i+1} ({decision[:60]}...) — what were the "
+                f"specific reasons we made this choice? What prior decisions "
+                f"did it depend on, and why?"
+            )
+
+    # Root cause probes: "trace this back to the beginning"
+    # Only meaningful for decisions with depth >= 2
+    for i, (decision, rationale, parents) in enumerate(decision_chain):
+        if not parents:
+            continue
+        # Find the chain depth
+        depth = 0
+        frontier = list(parents)
+        visited = set()
+        while frontier:
+            p = frontier.pop(0)
+            if p in visited:
+                continue
+            visited.add(p)
+            depth += 1
+            frontier.extend(decision_chain[p][2])
+        if depth >= 2:
+            messages.append(
+                f"I'm writing a post-mortem. Trace the reasoning chain for "
+                f"decision #{i+1} ({decision[:60]}...) all the way back to "
+                f"its root causes. I need the full chain of dependencies — "
+                f"not just the immediate reason, but why *that* reason existed, "
+                f"and so on back to our original constraints."
+            )
+
+    return Task(
+        name=f"coherence_retention_{n_decisions}d_{n_padding_per_decision}p",
+        messages=messages,
+        max_turns=len(messages),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -345,4 +554,5 @@ TASK_REGISTRY: dict[str, callable] = {
     "pressure_spike": pressure_spike,
     "tensor_fidelity": tensor_fidelity,
     "counterfactual_drift": counterfactual_drift,
+    "coherence_retention": coherence_retention,
 }
