@@ -75,6 +75,10 @@ _DEPENDS_ON_PATTERN = re.compile(
     r'<depends-on\s+handle="([^"]+)"\s*/?>',
 )
 
+_TRACE_PATTERN = re.compile(
+    r'<trace\s+handle="([^"]+)"\s*/?>',
+)
+
 
 def extract_signals(response_text: str) -> list[dict[str, Any]]:
     """Extract cooperative memory signals from a model response.
@@ -133,6 +137,13 @@ def extract_signals(response_text: str) -> list[dict[str, Any]]:
                     "handle": handle,
                     "depends_on": depends_on,
                 })
+
+        # Trace signals — provenance chain traversal
+        for m in _TRACE_PATTERN.finditer(block):
+            signals.append({
+                "type": "trace",
+                "handle": m.group(1),
+            })
 
     return signals
 

@@ -521,6 +521,11 @@ class Gateway:
                 handle=handle,
                 depends_on=data.get("depends_on"),
             )
+        elif signal_type == "trace":
+            return ResponseSignal(
+                type=ResponseSignalType.TRACE,
+                handle=handle,
+            )
         else:
             raise ValueError(f"Unknown signal type: {signal_type}")
 

@@ -60,6 +60,7 @@ class ResponseSignalType(Enum):
     RETAIN = auto()     # model wants to keep content (cancel pending removal)
     RECALL = auto()     # model wants to recall evicted content
     DECLARE = auto()    # model declares dependency edges (immutable)
+    TRACE = auto()      # model wants provenance chain for a handle
 
 
 @dataclass
@@ -372,6 +373,8 @@ class Orchestrator:
                 self._handle_recall(signal)
             case ResponseSignalType.DECLARE:
                 self._handle_declare(signal)
+            case ResponseSignalType.TRACE:
+                self._handle_trace(signal)
 
     def _handle_release(self, signal: ResponseSignal) -> None:
         """Model wants to release content with a tensor replacement."""
@@ -492,6 +495,68 @@ class Orchestrator:
                     [h[:8] for h in signal.depends_on],
                 )
             return
+
+    def _handle_trace(self, signal: ResponseSignal) -> None:
+        """Model wants the provenance chain for a handle.
+
+        Walks the dependency graph breadth-first, recalling each
+        block in the chain. The model gets the full reasoning chain
+        paged back into context, not just the immediate block.
+
+        Depth is capped to prevent runaway traversal.
+        """
+        max_depth = 10
+        visited: set[str] = set()
+        frontier: list[str] = [signal.handle]
+        recalled: list[str] = []
+
+        while frontier and len(visited) < max_depth:
+            handle = frontier.pop(0)
+            if handle in visited:
+                continue
+            visited.add(handle)
+
+            # Find the block anywhere in the projection
+            block = None
+            for region in self.projection.regions.values():
+                block = region.find(handle)
+                if block is not None:
+                    break
+
+            if block is None:
+                continue
+
+            # If evicted, recall it
+            if block.status == ContentStatus.AVAILABLE:
+                result = self._recall_page(handle)
+                if result is not None:
+                    recalled.append(handle)
+                    self._emit(
+                        EventKind.BLOCK_RECALLED,
+                        handle=handle,
+                        fault_count=block.access.fault_count,
+                        evicted_at=block.access.evicted_at,
+                    )
+
+            # Follow edges
+            deps = block.metadata.get("depends_on", [])
+            for dep_handle in deps:
+                if dep_handle not in visited:
+                    frontier.append(dep_handle)
+
+        if recalled:
+            log.info(
+                "trace from %s recalled %d blocks: %s",
+                signal.handle[:8],
+                len(recalled),
+                [h[:8] for h in recalled],
+            )
+        self._emit(
+            EventKind.SIGNAL_TRACE,
+            handle=signal.handle,
+            visited=[h[:8] for h in visited],
+            recalled=[h[:8] for h in recalled],
+        )
 
     def _execute_pending_removals(self) -> int:
         """Execute all pending removals that have tensor replacements.
