@@ -27,6 +27,58 @@ from typing import Any, Callable
 
 log = logging.getLogger("tinkuy.gateway")
 
+# ---------------------------------------------------------------------------
+# Cooperative memory protocol — injected alongside the page table
+# ---------------------------------------------------------------------------
+
+MEMORY_PROTOCOL = """\
+<yuyay-memory-protocol>
+This conversation is managed by Tinkuy, a virtual memory system. The
+<yuyay-page-table> above shows what content is in memory, including
+evicted blocks that can be recalled.
+
+You can emit cooperative memory signals inside <yuyay-response> blocks.
+These are metadata — they will be stripped from your visible response.
+
+SIGNALS:
+
+  <release handle="H" losses="what was lost">
+    Offer to release content block H. Provide a tensor (compressed
+    summary) that can replace it. Declare what information is lost.
+  </release>
+  <tensor handle="H">compressed summary here</tensor>
+
+  <retain handle="H" />
+    Cancel a pending eviction for block H. Use when you still need it.
+
+  <recall handle="H" />
+    Page fault: request that evicted block H be restored to context.
+
+  <declare handle="H">
+    <depends-on handle="P1" />
+    <depends-on handle="P2" />
+  </declare>
+    Declare that block H depends on blocks P1, P2. Emit this when you
+    make a decision that builds on prior content. Edges are immutable —
+    they record the reasoning chain at the moment it was live.
+
+  <trace handle="H" />
+    Request the full provenance chain for block H. The system walks
+    the dependency graph and recalls all ancestors. Use when you need
+    to reconstruct *why* a decision was made, not just *what* it was.
+
+Wrap all signals in <yuyay-response>...</yuyay-response>.
+
+WHEN TO DECLARE EDGES: When your response makes a decision, conclusion,
+or recommendation that depends on earlier content, declare the edges
+immediately. You know the dependencies now — they will be harder to
+reconstruct later.
+
+WHEN TO TRACE: When you need to explain *why* something was decided
+and the reasoning chain is not in your current context, trace the
+handle. The system will page in the chain.
+</yuyay-memory-protocol>"""
+
 from tinkuy.core.adapter import IngestAdapter
 from tinkuy.core.events import ConsoleStatusConsumer, EventBus, EventLog
 from tinkuy.core.orchestrator import (
@@ -287,6 +339,8 @@ class Gateway:
             page_table = self._anthropic_live.synthesize_page_table()
             if page_table:
                 self._inject_page_table(payload, page_table)
+                # Protocol instructions alongside the page table
+                self._inject_memory_protocol(payload)
 
         pressure = self.orchestrator.scheduler.read_pressure(
             self.orchestrator.projection
@@ -492,6 +546,18 @@ class Gateway:
             payload["system"] = system
         elif isinstance(system, str):
             payload["system"] = system + "\n\n" + page_table
+
+    def _inject_memory_protocol(self, payload: dict[str, Any]) -> None:
+        """Inject the cooperative memory protocol instructions."""
+        system = payload.get("system", [])
+        if isinstance(system, list):
+            system.append({
+                "type": "text",
+                "text": MEMORY_PROTOCOL,
+            })
+            payload["system"] = system
+        elif isinstance(system, str):
+            payload["system"] = system + "\n\n" + MEMORY_PROTOCOL
 
     def _parse_signal(self, data: dict[str, Any]) -> ResponseSignal:
         """Parse a cooperative memory signal from raw dict."""
