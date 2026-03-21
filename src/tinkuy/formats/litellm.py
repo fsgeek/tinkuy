@@ -178,15 +178,18 @@ class LiteLLMAdapter:
             )
 
         for e in individual:
-            lines.append(
-                f'  <entry handle="{e["handle"]}" '
+            attrs = (
+                f'handle="{e["handle"]}" '
                 f'kind="{e["kind"]}" '
                 f'status="{e["status"]}" '
                 f'size_tokens="{e["size_tokens"]}" '
                 f'faults="{e["fault_count"]}" '
                 f'age_turns="{e["age_turns"]}" '
-                f'label="{e["label"]}"/>'
+                f'label="{e["label"]}"'
             )
+            if e.get("depends_on"):
+                attrs += f' depends_on="{",".join(e["depends_on"])}"'
+            lines.append(f'  <entry {attrs}/>')
 
         lines.append("</yuyay-page-table>")
         return "\n".join(lines)

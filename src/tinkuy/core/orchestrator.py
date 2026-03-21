@@ -570,7 +570,7 @@ class Orchestrator:
         for rid in (RegionID.DURABLE, RegionID.EPHEMERAL):
             region = self.projection.region(rid)
             for block in region.blocks:
-                entries.append({
+                entry = {
                     "handle": block.handle,
                     "kind": block.kind.name.lower(),
                     "label": block.label,
@@ -581,5 +581,8 @@ class Orchestrator:
                     "age_turns": max(
                         0, self.turn - block.access.last_access_turn
                     ),
-                })
+                }
+                if block.metadata.get("depends_on"):
+                    entry["depends_on"] = block.metadata["depends_on"]
+                entries.append(entry)
         return entries
