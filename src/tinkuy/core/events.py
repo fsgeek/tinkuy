@@ -41,6 +41,7 @@ class EventKind(Enum):
     SIGNAL_RELEASE = auto()
     SIGNAL_RETAIN = auto()
     SIGNAL_RECALL = auto()
+    SIGNAL_DECLARE = auto()
 
     # Turn lifecycle
     TURN_BEGAN = auto()

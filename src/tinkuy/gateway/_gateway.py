@@ -21,6 +21,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Callable
 
@@ -46,8 +47,17 @@ from tinkuy.core.store import (
     MemoryPageStore,
     PageStore,
 )
-from tinkuy.formats.anthropic import LiveAdapter
+from tinkuy.formats.anthropic import LiveAdapter as AnthropicLiveAdapter
+from tinkuy.formats.gemini import (
+    GeminiLiveAdapter,
+    GeminiInboundAdapter,
+    GeminiResponseIngester,
+)
 
+class APIFormat(Enum):
+    """Supported API formats."""
+    ANTHROPIC = auto()
+    GEMINI = auto()
 
 @dataclass
 class GatewayConfig:
@@ -57,6 +67,7 @@ class GatewayConfig:
     session_id: str | None = None      # session identity (from adapter)
     enable_console: bool = False        # console status consumer
     enable_event_log: bool = True       # in-memory event log
+    format: APIFormat = APIFormat.ANTHROPIC
 
 
 @dataclass
@@ -109,7 +120,7 @@ class TurnTelemetry:
 @dataclass
 class TurnResult:
     """What the gateway returns to the harness after a turn."""
-    api_payload: dict[str, Any]        # synthesized Anthropic API payload
+    api_payload: dict[str, Any]        # synthesized API payload (Anthropic or Gemini)
     record: TurnRecord                 # observability record
     pressure_zone: PressureZone        # current pressure after this turn
     pending_evictions: list[str] = field(default_factory=list)  # handles
@@ -118,7 +129,7 @@ class TurnResult:
 class Gateway:
     """The integration layer.
 
-    A harness creates a Gateway, optionally rehydrates or resumes it,
+    A harness creates a Gateway, optionally rehydrate or resumes it,
     then calls process_turn() for each request/response cycle.
     """
 
@@ -127,8 +138,15 @@ class Gateway:
         self._setup_stores()
         self._setup_bus()
         self._setup_orchestrator()
+        
+        # Adapters
         self._ingest = IngestAdapter(self.orchestrator)
-        self._live = LiveAdapter(self.orchestrator)
+        self._anthropic_live = AnthropicLiveAdapter(self.orchestrator)
+        
+        self._gemini_live = GeminiLiveAdapter(self.orchestrator)
+        self._gemini_inbound = GeminiInboundAdapter()
+        self._gemini_response = GeminiResponseIngester(self.orchestrator)
+        
         self.telemetry: list[TurnTelemetry] = []
         self._client_overhead_tokens: int | None = None
 
@@ -201,7 +219,7 @@ class Gateway:
         )
         gw.orchestrator = restored
         gw._ingest = IngestAdapter(gw.orchestrator)
-        gw._live = LiveAdapter(gw.orchestrator)
+        # Note: adapters use self.orchestrator which is now 'restored'
         return gw
 
     def rehydrate(self, source: str | Path | dict[str, Any]) -> None:
@@ -222,33 +240,29 @@ class Gateway:
 
     def process_turn(
         self,
-        user_content: str,
+        user_content: str | None = None,
         tool_results: list[dict[str, str]] | None = None,
+        events: list[InboundEvent] | None = None,
     ) -> TurnResult:
-        """Process a single turn: user message → API payload.
+        """Process a single turn.
 
-        This is the main entry point for live operation. The harness
-        calls this with user content (and optional tool results),
-        and gets back a synthesized API payload ready for the
-        Anthropic API.
-
-        The harness is responsible for:
-          1. Calling the API with the payload
-          2. Passing the response back via ingest_response()
+        Accepts either user_content/tool_results (shorthand) or
+        a pre-parsed list of InboundEvents.
         """
-        events: list[InboundEvent] = []
+        inbound = events or []
+        
+        # User message shorthand
+        if user_content:
+            inbound.append(InboundEvent(
+                type=EventType.USER_MESSAGE,
+                content=user_content,
+                label="user",
+            ))
 
-        # User message
-        events.append(InboundEvent(
-            type=EventType.USER_MESSAGE,
-            content=user_content,
-            label="user",
-        ))
-
-        # Tool results
+        # Tool results shorthand
         if tool_results:
             for tr in tool_results:
-                events.append(InboundEvent(
+                inbound.append(InboundEvent(
                     type=EventType.TOOL_RESULT,
                     content=tr.get("content", ""),
                     label=tr.get("name", "tool_result"),
@@ -256,20 +270,23 @@ class Gateway:
                 ))
 
         # Begin turn
-        record = self.orchestrator.begin_turn(events)
+        record = self.orchestrator.begin_turn(inbound)
 
         # Apply eviction decisions
         pending = self.orchestrator.apply_decisions(
             record.eviction_decisions
         )
 
-        # Synthesize API payload
-        payload = self._live.synthesize_messages()
-
-        # Inject page table into system if there are evicted blocks
-        page_table = self._live.synthesize_page_table()
-        if page_table:
-            self._inject_page_table(payload, page_table)
+        # Synthesize API payload based on format
+        if self.config.format == APIFormat.GEMINI:
+            payload = self._gemini_live.synthesize_request()
+            # TODO: Inject page table for Gemini if needed
+        else:
+            payload = self._anthropic_live.synthesize_messages()
+            # Inject page table into system if there are evicted blocks
+            page_table = self._anthropic_live.synthesize_page_table()
+            if page_table:
+                self._inject_page_table(payload, page_table)
 
         pressure = self.orchestrator.scheduler.read_pressure(
             self.orchestrator.projection
@@ -288,11 +305,7 @@ class Gateway:
         signals: list[dict[str, Any]] | None = None,
         content_blocks: list[dict[str, Any]] | None = None,
     ) -> TurnRecord:
-        """Ingest an API response after the harness calls the API.
-
-        The harness should extract cooperative memory signals from
-        the response and pass them here.
-        """
+        """Ingest an API response after the harness calls the API."""
         parsed_signals: list[ResponseSignal] | None = None
         if signals:
             parsed_signals = [
@@ -314,41 +327,34 @@ class Gateway:
     # --- Raw request/response boundary (DEATH TO PROXIES) ---
 
     def prepare_request(self, client_body: dict[str, Any]) -> dict[str, Any]:
-        """Accept a raw client request body, return a complete upstream body.
-
-        This is THE boundary. The client body enters, the gateway's
-        projection-synthesized payload exits. The HTTP layer calls this
-        and forwards the result. It never touches message content.
-        """
+        """Anthropic-specific request preparation."""
+        self.config.format = APIFormat.ANTHROPIC
         request_messages = client_body.get("messages", [])
         user_content, tool_results = _extract_user_content(request_messages)
 
         log.info(
-            "← request | session=%s stream=%s model=%s "
+            "← request (anthropic) | session=%s stream=%s "
             "client_messages=%d user_content_len=%d tool_results=%d",
             self.config.session_id or "default",
             client_body.get("stream", False),
-            client_body.get("model", "?"),
             len(request_messages),
             len(user_content) if user_content else 0,
             len(tool_results) if tool_results else 0,
         )
 
-        # Always process through the gateway — no exceptions, no fallback
         turn_result = self.process_turn(
             user_content=user_content or "",
             tool_results=tool_results,
         )
 
-        # Build complete upstream body: client's non-message fields +
-        # gateway's synthesized messages and system prompt
+        # Build complete upstream body
         upstream: dict[str, Any] = {
             k: v for k, v in client_body.items()
             if k not in ("messages", "system")
         }
         upstream["messages"] = turn_result.api_payload.get("messages", [])
 
-        # Merge system prompts: preserve client's, append gateway's
+        # Merge system prompts
         gateway_system = turn_result.api_payload.get("system")
         client_system = client_body.get("system")
         if gateway_system is not None and client_system is not None:
@@ -358,24 +364,41 @@ class Gateway:
         elif client_system is not None:
             upstream["system"] = client_system
 
+        return upstream
+
+    def prepare_gemini_request(self, client_body: dict[str, Any]) -> dict[str, Any]:
+        """Gemini-specific request preparation."""
+        self.config.format = APIFormat.GEMINI
+        
+        events = self._gemini_inbound.parse_request(client_body)
+
         log.info(
-            "  synth | messages=%d system=%s",
-            len(upstream.get("messages", [])),
-            "yes" if "system" in upstream else "no",
+            "← request (gemini) | session=%s model=%s events=%d",
+            self.config.session_id or "default",
+            client_body.get("model", "?"),
+            len(events),
         )
 
+        turn_result = self.process_turn(events=events)
+
+        # Build complete upstream Gemini request
+        upstream = {
+            k: v for k, v in client_body.items()
+            if k not in ("contents", "system_instruction", "tools")
+        }
+        synth = turn_result.api_payload
+        upstream["contents"] = synth.get("contents", [])
+        if "system_instruction" in synth:
+            upstream["system_instruction"] = synth["system_instruction"]
+        if "tools" in synth:
+            upstream["tools"] = synth["tools"]
+            
         return upstream
 
     def ingest_raw_response(
         self, text: str, content_blocks: list[dict[str, Any]] | None = None,
     ) -> TurnRecord | None:
-        """Ingest raw assistant response text and structured content.
-
-        Extracts cooperative memory signals, strips them, and feeds
-        the clean text into the orchestrator. content_blocks preserves
-        the full Anthropic content array (text + tool_use) so the
-        projection can synthesize faithful messages on the next turn.
-        """
+        """Ingest raw assistant response text and structured content."""
         if not text and not content_blocks:
             return None
         from tinkuy.gateway.harness import extract_signals, strip_signals
@@ -392,76 +415,45 @@ class Gateway:
         text, content_blocks = _extract_response_content_from_json(response_data)
         return self.ingest_raw_response(text, content_blocks=content_blocks)
 
+    def ingest_gemini_response(self, response_data: dict[str, Any]) -> TurnRecord | None:
+        """Ingest a complete Gemini API response JSON."""
+        return self._gemini_response.ingest_response(response_data)
+
     # --- Telemetry ---
 
     def report_telemetry(self, telemetry: TurnTelemetry) -> None:
-        """Report API telemetry from the last turn.
-
-        This is the data pipeline — the server hands us ground-truth
-        numbers from the API, we use them to calibrate pressure and
-        build the research record.
-        """
+        """Report API telemetry from the last turn."""
         telemetry.turn = self.turn
         self.telemetry.append(telemetry)
 
-        # Calibrate pressure: the API knows the true context size.
-        # Our projection only counts what we ingested. The difference
-        # is the client overhead (system prompt, tools, etc.) which
-        # is roughly constant for a session.
-        #
-        # When api_total < projection_tokens, the projection has stale
-        # content from a prior session (resumed checkpoint). The API
-        # only saw what we actually sent — so api_total is the truth.
         api_total = telemetry.total_input_tokens
         projection_tokens = self.orchestrator.projection.total_tokens
         if api_total > 0:
             if api_total > projection_tokens:
                 overhead = api_total - projection_tokens
             else:
-                # Stale projection — the API saw less than we think.
-                # Client overhead is at least api_total minus what a
-                # fresh projection would hold. Use api_total as floor.
                 overhead = 0
-                log.warning(
-                    "  telemetry | projection (%d tok) exceeds API total "
-                    "(%d tok) — stale checkpoint?",
-                    projection_tokens, api_total,
-                )
 
             if self._client_overhead_tokens is None:
                 self._client_overhead_tokens = overhead
-                log.info(
-                    "  telemetry | client overhead calibrated: %d tokens "
-                    "(api=%d, projection=%d)",
-                    overhead, api_total, projection_tokens,
-                )
             else:
                 self._client_overhead_tokens = int(
                     0.3 * self._client_overhead_tokens + 0.7 * overhead
                 )
 
         log.info(
-            "  telemetry | %s in=%d+%dcache out=%d stop=%s "
-            "blocks=%d/%d/%d overhead=%s",
+            "  telemetry | %s in=%d+%dcache out=%d overhead=%s",
             telemetry.message_id[:12] if telemetry.message_id else "?",
             telemetry.input_tokens,
             telemetry.cache_read_tokens,
             telemetry.output_tokens,
-            telemetry.stop_reason or "?",
-            telemetry.text_blocks,
-            telemetry.thinking_blocks,
-            telemetry.tool_use_blocks,
             f"{self._client_overhead_tokens:,}"
             if self._client_overhead_tokens is not None else "uncalibrated",
         )
 
     @property
     def calibrated_total_tokens(self) -> int:
-        """Projection tokens + estimated client overhead.
-
-        This is our best estimate of what the API will actually see.
-        Use this for pressure decisions, not projection.total_tokens.
-        """
+        """Projection tokens + estimated client overhead."""
         base = self.orchestrator.projection.total_tokens
         return base + (self._client_overhead_tokens or 0)
 
@@ -523,25 +515,26 @@ class Gateway:
                 type=ResponseSignalType.RECALL,
                 handle=handle,
             )
+        elif signal_type == "declare":
+            return ResponseSignal(
+                type=ResponseSignalType.DECLARE,
+                handle=handle,
+                depends_on=data.get("depends_on"),
+            )
         else:
             raise ValueError(f"Unknown signal type: {signal_type}")
 
 
-# --- Helpers (owned by the gateway, not the HTTP layer) ---
+# --- Helpers ---
 
 
 def _extract_user_content(
     messages: list[dict[str, Any]],
 ) -> tuple[str, list[dict[str, str]] | None]:
-    """Extract user content and tool results from the last turn.
-
-    This parses Anthropic message format. It lives here because
-    understanding message content is gateway logic, not HTTP logic.
-    """
+    """Extract user content and tool results from the last turn."""
     user_parts: list[str] = []
     tool_results: list[dict[str, str]] = []
 
-    # Walk backwards to find the last user turn
     for msg in reversed(messages):
         if msg.get("role") != "user":
             break
@@ -571,14 +564,7 @@ def _merge_system(
     client_system: Any,
     gateway_system: Any,
 ) -> Any:
-    """Merge client's system prompt with gateway additions (page table).
-
-    The client's system prompt is preserved as-is. Gateway additions
-    are appended only if they contain content not already present in
-    the client's system. cache_control is stripped from gateway
-    additions since the client owns caching strategy.
-    """
-    # Normalize both to lists
+    """Merge client's system prompt with gateway additions."""
     if isinstance(client_system, str):
         client_parts = [{"type": "text", "text": client_system}]
     elif isinstance(client_system, list):
@@ -594,8 +580,6 @@ def _merge_system(
     else:
         gw_parts = []
 
-    # Deduplicate: only append gateway parts whose text isn't already
-    # present in the client system
     client_texts = {p.get("text", "") for p in client_parts
                     if isinstance(p, dict)}
     new_parts = [p for p in gw_parts

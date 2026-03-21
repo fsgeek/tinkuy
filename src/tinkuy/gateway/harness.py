@@ -66,6 +66,15 @@ _TENSOR_CONTENT_PATTERN = re.compile(
     re.DOTALL,
 )
 
+_DECLARE_PATTERN = re.compile(
+    r'<declare\s+handle="([^"]+)"[^>]*>(.*?)</declare>',
+    re.DOTALL,
+)
+
+_DEPENDS_ON_PATTERN = re.compile(
+    r'<depends-on\s+handle="([^"]+)"\s*/?>',
+)
+
 
 def extract_signals(response_text: str) -> list[dict[str, Any]]:
     """Extract cooperative memory signals from a model response.
@@ -112,6 +121,18 @@ def extract_signals(response_text: str) -> list[dict[str, Any]]:
                 "type": "recall",
                 "handle": m.group(1),
             })
+
+        # Declare signals — dependency edges (immutable once emitted)
+        for m in _DECLARE_PATTERN.finditer(block):
+            handle = m.group(1)
+            body = m.group(2)
+            depends_on = _DEPENDS_ON_PATTERN.findall(body)
+            if depends_on:
+                signals.append({
+                    "type": "declare",
+                    "handle": handle,
+                    "depends_on": depends_on,
+                })
 
     return signals
 

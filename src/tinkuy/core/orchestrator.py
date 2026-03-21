@@ -59,6 +59,7 @@ class ResponseSignalType(Enum):
     RELEASE = auto()    # model wants to release content (with tensor)
     RETAIN = auto()     # model wants to keep content (cancel pending removal)
     RECALL = auto()     # model wants to recall evicted content
+    DECLARE = auto()    # model declares dependency edges (immutable)
 
 
 @dataclass
@@ -77,6 +78,7 @@ class ResponseSignal:
     handle: str
     tensor_content: str | None = None    # for RELEASE
     declared_losses: str | None = None   # for RELEASE
+    depends_on: list[str] | None = None  # for DECLARE — parent handles
 
 
 @dataclass
@@ -368,6 +370,8 @@ class Orchestrator:
                 self._handle_retain(signal)
             case ResponseSignalType.RECALL:
                 self._handle_recall(signal)
+            case ResponseSignalType.DECLARE:
+                self._handle_declare(signal)
 
     def _handle_release(self, signal: ResponseSignal) -> None:
         """Model wants to release content with a tensor replacement."""
@@ -455,6 +459,39 @@ class Orchestrator:
                         evicted_at=block.access.evicted_at,
                     )
                     break
+
+    def _handle_declare(self, signal: ResponseSignal) -> None:
+        """Model declares dependency edges for a content block.
+
+        Edges are immutable — once declared, they are never modified.
+        Like Paxos consensus: a decision once made doesn't change.
+        It can be superseded by a new decision, but the original
+        edges remain as historical record.
+
+        Edges are stored in metadata["depends_on"] as a list of
+        handles. These survive checkpointing and eviction.
+        """
+        if not signal.depends_on:
+            return
+
+        for region in self.projection.regions.values():
+            block = region.find(signal.handle)
+            if block is None:
+                continue
+            # Immutable: only write if not already declared
+            if "depends_on" not in block.metadata:
+                block.metadata["depends_on"] = list(signal.depends_on)
+                self._emit(
+                    EventKind.SIGNAL_DECLARE,
+                    handle=signal.handle,
+                    depends_on=signal.depends_on,
+                )
+                log.info(
+                    "declared edges: %s → %s",
+                    signal.handle[:8],
+                    [h[:8] for h in signal.depends_on],
+                )
+            return
 
     def _execute_pending_removals(self) -> int:
         """Execute all pending removals that have tensor replacements.
