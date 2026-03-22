@@ -579,8 +579,14 @@ class Gateway:
                 content = msg["content"]
                 if isinstance(content, str):
                     content = [{"type": "text", "text": content}]
-                # Prepend page table so it's visible before the user's text
-                content.insert(0, {
+                # Insert page table after any tool_result blocks.
+                # The API requires tool_results first when the prior
+                # assistant message had tool_use blocks.
+                insert_idx = 0
+                for j, block in enumerate(content):
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        insert_idx = j + 1
+                content.insert(insert_idx, {
                     "type": "text",
                     "text": page_table,
                 })
