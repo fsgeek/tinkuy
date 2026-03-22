@@ -419,6 +419,18 @@ class Gateway:
     def prepare_request(self, client_body: dict[str, Any]) -> dict[str, Any]:
         """Anthropic-specific request preparation."""
         request_messages = client_body.get("messages", [])
+
+        # Cold start: if the projection is empty but the client has
+        # conversation history, bootstrap the projection from the
+        # client's messages. This is NOT the proxy pattern — we ingest
+        # the history into the projection so the gateway has state.
+        if self.orchestrator.turn == 0 and len(request_messages) > 1:
+            log.info(
+                "cold start: bootstrapping projection from %d client messages",
+                len(request_messages),
+            )
+            self._bootstrap_from_client(request_messages, client_body)
+
         user_content, tool_results = _extract_user_content(request_messages)
 
         log.info(
@@ -565,6 +577,89 @@ class Gateway:
         return self.orchestrator.page_table()
 
     # --- Internal ---
+
+    def _bootstrap_from_client(
+        self,
+        messages: list[dict[str, Any]],
+        client_body: dict[str, Any],
+    ) -> None:
+        """Bootstrap the projection from the client's conversation history.
+
+        Called on cold start when the projection is empty but the client
+        has existing conversation state. Ingests all messages except the
+        last user turn (which will be processed normally).
+
+        This is NOT the proxy pattern. The client messages are ingested
+        into the projection — the gateway owns the resulting state.
+        """
+        from tinkuy.core.orchestrator import EventType, InboundEvent
+
+        # Ingest system prompt if present
+        client_system = client_body.get("system")
+        if client_system:
+            system_text = client_system
+            if isinstance(client_system, list):
+                system_text = "\n".join(
+                    p.get("text", "") for p in client_system
+                    if isinstance(p, dict)
+                )
+            self.orchestrator.begin_turn([
+                InboundEvent(
+                    type=EventType.SYSTEM_UPDATE,
+                    content=system_text,
+                    label="client system prompt",
+                )
+            ])
+
+        # Find the boundary: everything before the last user turn is history
+        last_user_start = len(messages)
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                last_user_start = i
+            else:
+                break
+
+        # Ingest history messages into the projection as turns
+        history = messages[:last_user_start]
+        for msg in history:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+
+            if isinstance(content, list):
+                # Extract text and tool_use/tool_result blocks
+                text_parts = []
+                for block in content:
+                    if isinstance(block, dict):
+                        if block.get("type") == "text":
+                            text_parts.append(block.get("text", ""))
+                content_str = "\n".join(text_parts)
+            else:
+                content_str = str(content)
+
+            if not content_str.strip():
+                continue
+
+            if role == "user":
+                self.orchestrator.begin_turn([
+                    InboundEvent(
+                        type=EventType.USER_MESSAGE,
+                        content=content_str,
+                        label="user",
+                    )
+                ])
+            elif role == "assistant":
+                self.orchestrator.ingest_response(
+                    content=content_str,
+                    label="assistant",
+                )
+
+        log.info(
+            "bootstrap complete: ingested %d history messages, "
+            "projection turn=%d tokens=%d",
+            len(history),
+            self.orchestrator.turn,
+            self.orchestrator.projection.total_tokens,
+        )
 
     def _inject_memory_protocol(self, payload: dict[str, Any]) -> None:
         """Inject the cooperative memory protocol instructions."""
