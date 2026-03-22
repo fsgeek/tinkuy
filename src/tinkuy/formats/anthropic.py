@@ -65,7 +65,9 @@ class LiveAdapter:
         """Synthesize a complete Anthropic API messages payload.
 
         Reads the projection regions and constructs a valid messages
-        array with proper user/assistant alternation.
+        array with proper user/assistant alternation. The page table
+        is injected here (not by the gateway) because placement must
+        respect tool_result ordering and other layout constraints.
         """
         projection = self.orchestrator.projection
         payload: dict[str, Any] = {}
@@ -76,9 +78,47 @@ class LiveAdapter:
             payload["system"] = system_parts
 
         # R2 + R3 + R4 → messages with proper alternation
-        payload["messages"] = self._collect_messages(projection)
+        messages = self._collect_messages(projection)
 
+        # Page table → last user message, after any tool_result blocks.
+        # The page table is per-turn volatile and must NOT go in the
+        # system block (cache-busting) or before tool_results (API error).
+        page_table = self.synthesize_page_table()
+        if page_table:
+            self._inject_page_table(messages, page_table)
+
+        payload["messages"] = messages
         return payload
+
+    def _inject_page_table(
+        self, messages: list[dict[str, Any]], page_table: str
+    ) -> None:
+        """Place page table in the last user message, after tool_results.
+
+        The Anthropic API requires tool_result blocks to appear before
+        other content in a user message when the prior assistant message
+        had tool_use blocks. The page table goes after all tool_results.
+        """
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") != "user":
+                continue
+            msg = messages[i]
+            content = msg["content"]
+            if isinstance(content, str):
+                content = [{"type": "text", "text": content}]
+
+            # Find insertion point: after the last tool_result
+            insert_idx = 0
+            for j, block in enumerate(content):
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    insert_idx = j + 1
+
+            content.insert(insert_idx, {
+                "type": "text",
+                "text": page_table,
+            })
+            msg["content"] = content
+            return
 
     def _collect_system(self, projection: Projection) -> list[dict[str, Any]]:
         """Collect system content from R0 (tools) and R1 (system)."""

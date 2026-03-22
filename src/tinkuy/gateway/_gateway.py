@@ -372,12 +372,10 @@ class Gateway:
             # TODO: Inject page table for Gemini format
             return payload
 
-        # Anthropic (default)
+        # Anthropic (default) — synthesize_messages handles page table
+        # placement internally, respecting tool_result ordering.
         payload = self._anthropic_live.synthesize_messages()
-        page_table = self._anthropic_live.synthesize_page_table()
-        if page_table:
-            self._inject_page_table(payload, page_table)
-            self._inject_memory_protocol(payload)
+        self._inject_memory_protocol(payload)
         return payload
 
     def ingest_response(
@@ -556,42 +554,6 @@ class Gateway:
         return self.orchestrator.page_table()
 
     # --- Internal ---
-
-    def _inject_page_table(
-        self, payload: dict[str, Any], page_table: str
-    ) -> None:
-        """Inject the page table into the last user message.
-
-        The page table is per-turn volatile — it must NOT go in the
-        system block or it will bust the entire system prompt cache.
-        Instead, inject it as a content block in the last user message,
-        which is always the current turn (R4) and never cached.
-        """
-        messages = payload.get("messages", [])
-        if not messages:
-            return
-
-        # Find the last user message
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i].get("role") == "user":
-                msg = messages[i]
-                # Normalize content to list form
-                content = msg["content"]
-                if isinstance(content, str):
-                    content = [{"type": "text", "text": content}]
-                # Insert page table after any tool_result blocks.
-                # The API requires tool_results first when the prior
-                # assistant message had tool_use blocks.
-                insert_idx = 0
-                for j, block in enumerate(content):
-                    if isinstance(block, dict) and block.get("type") == "tool_result":
-                        insert_idx = j + 1
-                content.insert(insert_idx, {
-                    "type": "text",
-                    "text": page_table,
-                })
-                msg["content"] = content
-                return
 
     def _inject_memory_protocol(self, payload: dict[str, Any]) -> None:
         """Inject the cooperative memory protocol instructions."""

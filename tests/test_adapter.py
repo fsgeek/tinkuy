@@ -287,12 +287,15 @@ def test_live_synthesize_messages_emits_tensor_marker_for_available_evicted_bloc
     live = LiveAdapter(Orchestrator(projection=projection))
     payload = live.synthesize_messages()
 
-    assert payload["messages"] == [
-        {
-            "role": "user",
-            "content": f"[tensor:{block.handle[:8]} — file read ({block.size_tokens} tokens)]",
-        }
-    ]
+    # Last user message has page table + tensor marker (list content)
+    msgs = payload["messages"]
+    assert len(msgs) == 1
+    assert msgs[0]["role"] == "user"
+    content = msgs[0]["content"]
+    assert isinstance(content, list)
+    texts = [b["text"] for b in content if b.get("type") == "text"]
+    assert any("<yuyay-page-table>" in t for t in texts)
+    assert any(f"[tensor:{block.handle[:8]}" in t for t in texts)
 
 
 def test_live_synthesize_messages_merges_consecutive_same_role_messages():
@@ -313,11 +316,16 @@ def test_live_synthesize_messages_merges_consecutive_same_role_messages():
     live = LiveAdapter(Orchestrator(projection=projection))
     payload = live.synthesize_messages()
 
-    # Consecutive same-role messages merge into a content block list
-    assert payload["messages"] == [{"role": "user", "content": [
-        {"type": "text", "text": "u1"},
-        {"type": "text", "text": "u2"},
-    ]}]
+    # Consecutive same-role messages merge into a content block list.
+    # Page table is also injected into the (only) user message.
+    msgs = payload["messages"]
+    assert len(msgs) == 1
+    assert msgs[0]["role"] == "user"
+    content = msgs[0]["content"]
+    assert isinstance(content, list)
+    texts = [b["text"] for b in content if b.get("type") == "text"]
+    assert "u1" in texts
+    assert "u2" in texts
 
 
 def test_live_synthesize_messages_starts_with_user_when_first_message_is_assistant():
@@ -332,7 +340,8 @@ def test_live_synthesize_messages_starts_with_user_when_first_message_is_assista
     live = LiveAdapter(Orchestrator(projection=projection))
     payload = live.synthesize_messages()
 
-    assert payload["messages"][0] == {"role": "user", "content": "[conversation start]"}
+    # [conversation start] padding gets the page table injected
+    assert payload["messages"][0]["role"] == "user"
     assert payload["messages"][1] == {"role": "assistant", "content": "assistant first"}
 
 
@@ -388,7 +397,15 @@ def test_full_cycle_ingest_then_synthesize_messages():
     assert [part["text"] for part in payload["system"]] == ["global policy"]
     _assert_strict_alternation(payload["messages"])
 
-    joined = "\n".join(m["content"] for m in payload["messages"])
+    # Content may be str or list (page table injection normalizes to list)
+    def _text(content):
+        if isinstance(content, str):
+            return content
+        return "\n".join(
+            b["text"] for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    joined = "\n".join(_text(m["content"]) for m in payload["messages"])
     assert "u1" in joined
     assert "u2" in joined
     assert "a1" in joined
