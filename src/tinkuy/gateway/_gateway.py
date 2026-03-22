@@ -17,13 +17,12 @@ Three modes of operation:
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 log = logging.getLogger("tinkuy.gateway")
 
@@ -95,9 +94,12 @@ from tinkuy.core.store import (
     CheckpointStore,
     FileCheckpointStore,
     FilePageStore,
+    FileTensorStore,
     MemoryCheckpointStore,
     MemoryPageStore,
+    MemoryTensorStore,
     PageStore,
+    TensorStore,
 )
 from tinkuy.formats.anthropic import LiveAdapter as AnthropicLiveAdapter
 from tinkuy.formats.gemini import (
@@ -107,7 +109,13 @@ from tinkuy.formats.gemini import (
 )
 
 class APIFormat(Enum):
-    """Supported API formats."""
+    """Supported API formats.
+
+    This is a per-request property, not a gateway configuration.
+    The gateway is format-agnostic — the projection is the source
+    of truth.  Format describes how a specific request arrived and
+    how its response should be synthesized.
+    """
     ANTHROPIC = auto()
     GEMINI = auto()
 
@@ -119,7 +127,8 @@ class GatewayConfig:
     session_id: str | None = None      # session identity (from adapter)
     enable_console: bool = False        # console status consumer
     enable_event_log: bool = True       # in-memory event log
-    format: APIFormat = APIFormat.ANTHROPIC
+    projector: Any = None              # Hamutay Projector sidecar (optional)
+    tensor_store: Any = None           # TensorStore backend (optional)
 
 
 @dataclass
@@ -203,10 +212,14 @@ class Gateway:
         self._client_overhead_tokens: int | None = None
 
     def _setup_stores(self) -> None:
-        """Initialize page store and checkpoint store.
+        """Initialize page store, checkpoint store, and tensor store.
 
         Page store is workspace-scoped (shared across sessions).
         Checkpoint store is session-scoped (keyed by session_id).
+        Tensor store is workspace-scoped (tensors are immutable and shared).
+
+        If config.tensor_store is provided (e.g. a Yanantin backend),
+        it takes precedence over the default filesystem store.
         """
         if self.config.data_dir:
             root = Path(self.config.data_dir)
@@ -218,9 +231,12 @@ class Gateway:
             else:
                 ckpt_path = root / "checkpoint.json"
             self.checkpoint_store: CheckpointStore = FileCheckpointStore(ckpt_path)
+            # Tensors are shared and immutable
+            self.tensor_store = self.config.tensor_store or FileTensorStore(root / "tensors")
         else:
             self.page_store = MemoryPageStore()
             self.checkpoint_store = MemoryCheckpointStore()
+            self.tensor_store = self.config.tensor_store or MemoryTensorStore()
 
     def _setup_bus(self) -> None:
         """Initialize event bus and consumers."""
@@ -244,6 +260,8 @@ class Gateway:
             event_bus=self.bus,
             page_store=self.page_store,
             checkpoint_store=self.checkpoint_store,
+            tensor_store=self.tensor_store,
+            projector=self.config.projector,
         )
 
     # --- Lifecycle ---
@@ -293,16 +311,21 @@ class Gateway:
     def process_turn(
         self,
         user_content: str | None = None,
-        tool_results: list[dict[str, str]] | None = None,
+        tool_results: list[dict[str, Any]] | None = None,
         events: list[InboundEvent] | None = None,
+        format: APIFormat = APIFormat.ANTHROPIC,
     ) -> TurnResult:
         """Process a single turn.
 
         Accepts either user_content/tool_results (shorthand) or
         a pre-parsed list of InboundEvents.
+
+        format is a per-request property: it determines which adapter
+        synthesizes the outbound payload.  The projection itself is
+        format-agnostic.
         """
         inbound = events or []
-        
+
         # User message shorthand
         if user_content:
             inbound.append(InboundEvent(
@@ -329,18 +352,8 @@ class Gateway:
             record.eviction_decisions
         )
 
-        # Synthesize API payload based on format
-        if self.config.format == APIFormat.GEMINI:
-            payload = self._gemini_live.synthesize_request()
-            # TODO: Inject page table for Gemini if needed
-        else:
-            payload = self._anthropic_live.synthesize_messages()
-            # Inject page table into system if there are evicted blocks
-            page_table = self._anthropic_live.synthesize_page_table()
-            if page_table:
-                self._inject_page_table(payload, page_table)
-                # Protocol instructions alongside the page table
-                self._inject_memory_protocol(payload)
+        # Synthesize API payload — adapter chosen per-request
+        payload = self._synthesize(format)
 
         pressure = self.orchestrator.scheduler.read_pressure(
             self.orchestrator.projection
@@ -352,6 +365,21 @@ class Gateway:
             pressure_zone=pressure.zone,
             pending_evictions=pending,
         )
+
+    def _synthesize(self, format: APIFormat) -> dict[str, Any]:
+        """Synthesize the outbound API payload for the given format."""
+        if format == APIFormat.GEMINI:
+            payload = self._gemini_live.synthesize_request()
+            # TODO: Inject page table for Gemini format
+            return payload
+
+        # Anthropic (default)
+        payload = self._anthropic_live.synthesize_messages()
+        page_table = self._anthropic_live.synthesize_page_table()
+        if page_table:
+            self._inject_page_table(payload, page_table)
+            self._inject_memory_protocol(payload)
+        return payload
 
     def ingest_response(
         self,
@@ -382,7 +410,6 @@ class Gateway:
 
     def prepare_request(self, client_body: dict[str, Any]) -> dict[str, Any]:
         """Anthropic-specific request preparation."""
-        self.config.format = APIFormat.ANTHROPIC
         request_messages = client_body.get("messages", [])
         user_content, tool_results = _extract_user_content(request_messages)
 
@@ -399,6 +426,7 @@ class Gateway:
         turn_result = self.process_turn(
             user_content=user_content or "",
             tool_results=tool_results,
+            format=APIFormat.ANTHROPIC,
         )
 
         # Build complete upstream body
@@ -422,8 +450,6 @@ class Gateway:
 
     def prepare_gemini_request(self, client_body: dict[str, Any]) -> dict[str, Any]:
         """Gemini-specific request preparation."""
-        self.config.format = APIFormat.GEMINI
-        
         events = self._gemini_inbound.parse_request(client_body)
 
         log.info(
@@ -433,7 +459,7 @@ class Gateway:
             len(events),
         )
 
-        turn_result = self.process_turn(events=events)
+        turn_result = self.process_turn(events=events, format=APIFormat.GEMINI)
 
         # Build complete upstream Gemini request
         upstream = {
@@ -601,10 +627,10 @@ class Gateway:
 
 def _extract_user_content(
     messages: list[dict[str, Any]],
-) -> tuple[str, list[dict[str, str]] | None]:
+) -> tuple[str, list[dict[str, Any]] | None]:
     """Extract user content and tool results from the last turn."""
     user_parts: list[str] = []
-    tool_results: list[dict[str, str]] = []
+    tool_results: list[dict[str, Any]] = []
 
     for msg in reversed(messages):
         if msg.get("role") != "user":
@@ -623,9 +649,14 @@ def _extract_user_content(
                             b.get("text", "") for b in result
                             if b.get("type") == "text"
                         )
+                    tool_use_id = block.get("tool_use_id", "tool")
                     tool_results.insert(0, {
                         "content": str(result),
-                        "name": block.get("tool_use_id", "tool"),
+                        "name": tool_use_id,
+                        "metadata": {
+                            "tool_use_id": tool_use_id,
+                            "is_error": block.get("is_error", False),
+                        },
                     })
 
     return "\n".join(user_parts), tool_results or None

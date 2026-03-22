@@ -25,8 +25,12 @@ def main() -> None:
         help="Port to listen on (default: auto-detect free port)",
     )
     serve_p.add_argument(
-        "--upstream", default="https://api.anthropic.com",
-        help="Upstream API base URL",
+        "--upstream", default=None,
+        help="Anthropic upstream URL (default: env or https://api.anthropic.com)",
+    )
+    serve_p.add_argument(
+        "--gemini-upstream", default=None,
+        help="Gemini upstream URL (default: env or https://generativelanguage.googleapis.com)",
     )
     serve_p.add_argument(
         "--data-dir", default=None,
@@ -44,6 +48,7 @@ def main() -> None:
         serve(
             port=args.port,
             upstream=args.upstream,
+            gemini_upstream=args.gemini_upstream,
             data_dir=args.data_dir,
             context_limit=args.context_limit,
         )

@@ -322,6 +322,14 @@ class Projection:
                             "label": b.label,
                             "status": b.status.name,
                             "size_tokens": b.size_tokens,
+                            # Present blocks carry their content in the
+                            # checkpoint — it has no other persistence
+                            # path until eviction writes it to the page
+                            # store.  Evicted blocks omit content (the
+                            # page store is authoritative for those).
+                            **({"content": b.content}
+                               if b.status == ContentStatus.PRESENT
+                               else {}),
                             "access": {
                                 "created_turn": b.access.created_turn,
                                 "last_access_turn": b.access.last_access_turn,
@@ -365,8 +373,7 @@ class Projection:
                     handle=block_data["handle"],
                     kind=ContentKind[block_data["kind"]],
                     label=block_data["label"],
-                    # Snapshots do not include verbatim content.
-                    content="",
+                    content=block_data.get("content", ""),
                     status=ContentStatus[block_data["status"]],
                     region=rid,
                     size_tokens=int(block_data.get("size_tokens", 0)),

@@ -37,14 +37,43 @@ def find_free_port() -> int:
         return s.getsockname()[1]
 
 
+def _resolve_upstream(provider: str, explicit: str | None = None) -> str:
+    """Resolve upstream URL for a provider.
+
+    Priority: explicit arg > environment variable > hardcoded default.
+    """
+    if explicit:
+        return explicit
+    defaults = {
+        "anthropic": (
+            ["ANTHROPIC_BASE_URL_UPSTREAM"],
+            "https://api.anthropic.com",
+        ),
+        "gemini": (
+            ["GOOGLE_GEMINI_BASE_URL", "GOOGLE_VERTEX_BASE_URL"],
+            "https://generativelanguage.googleapis.com",
+        ),
+    }
+    env_keys, fallback = defaults.get(provider, ([], ""))
+    for key in env_keys:
+        val = os.environ.get(key)
+        if val:
+            return val
+    return fallback
+
+
 def create_app(
     gateway_config: GatewayConfig | None = None,
-    upstream: str = "https://api.anthropic.com",
+    upstream: str | None = None,
+    gemini_upstream: str | None = None,
 ) -> Any:
     """Create the FastAPI application.
 
     Import is deferred so the rest of tinkuy works without
     fastapi/uvicorn installed.
+
+    Each provider gets its own upstream URL, resolved from explicit
+    args, environment variables, or hardcoded defaults.
     """
     try:
         from fastapi import FastAPI, Request, Response
@@ -55,10 +84,38 @@ def create_app(
             "Install with: pip install tinkuy[serve]"
         )
 
+    anthropic_upstream = _resolve_upstream("anthropic", upstream)
+    gemini_upstream_url = _resolve_upstream("gemini", gemini_upstream)
+
     config = gateway_config or GatewayConfig(enable_console=True)
 
     # Per-session gateways, keyed by session ID or a default
     gateways: dict[str, Gateway] = {}
+
+    def _extract_session_id(
+        header_value: Optional[str],
+        body: dict[str, Any] | None = None,
+    ) -> str | None:
+        """Extract session ID from header or body metadata.
+
+        Priority: explicit header > Claude Code metadata > None.
+        Claude Code buries session_id inside a JSON-encoded string
+        in metadata.user_id.
+        """
+        if header_value:
+            return header_value
+        if body:
+            metadata = body.get("metadata", {})
+            user_id_raw = metadata.get("user_id", "")
+            if isinstance(user_id_raw, str) and user_id_raw.startswith("{"):
+                try:
+                    parsed = json.loads(user_id_raw)
+                    sid = parsed.get("session_id")
+                    if sid:
+                        return sid
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        return None
 
     def get_gateway(session_id: Optional[str]) -> Gateway:
         key = session_id or "__default__"
@@ -78,8 +135,6 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        transport = httpx.AsyncHTTPTransport()
-
         async def log_request(request: httpx.Request):
             log.info(
                 "  WIRE -> %s %s (%d bytes)",
@@ -88,14 +143,21 @@ def create_app(
                 len(request.content) if request.content else 0,
             )
 
-        app.state.client = httpx.AsyncClient(
-            base_url=upstream,
-            timeout=httpx.Timeout(300.0, connect=10.0),
-            transport=transport,
-            event_hooks={"request": [log_request]},
+        event_hooks = {"request": [log_request]}
+        timeout = httpx.Timeout(300.0, connect=10.0)
+
+        app.state.anthropic_client = httpx.AsyncClient(
+            base_url=anthropic_upstream,
+            timeout=timeout,
+            event_hooks=event_hooks,
+        )
+        app.state.gemini_client = httpx.AsyncClient(
+            timeout=timeout,
+            event_hooks=event_hooks,
         )
         yield
-        await app.state.client.aclose()
+        await app.state.anthropic_client.aclose()
+        await app.state.gemini_client.aclose()
 
     app = FastAPI(
         title="tinkuy",
@@ -122,7 +184,9 @@ def create_app(
 
         body = await request.json()
         is_streaming = body.get("stream", False)
-        session_id = request.headers.get("x-tinkuy-session")
+        session_id = _extract_session_id(
+            request.headers.get("x-tinkuy-session"), body
+        )
         gw = get_gateway(session_id)
 
         # Gateway owns the transformation — one call, no branching
@@ -138,7 +202,7 @@ def create_app(
             headers.get("anthropic-beta", "MISSING"),
         )
 
-        client: httpx.AsyncClient = request.app.state.client
+        client: httpx.AsyncClient = request.app.state.anthropic_client
 
         if is_streaming:
             upstream_bytes = json.dumps(upstream_body).encode("utf-8")
@@ -239,7 +303,9 @@ def create_app(
         from starlette.responses import StreamingResponse
 
         body = await request.json()
-        session_id = request.headers.get("x-tinkuy-session")
+        session_id = _extract_session_id(
+            request.headers.get("x-tinkuy-session"), body
+        )
         gw = get_gateway(session_id)
 
         # 1. Transform through Gateway
@@ -250,13 +316,11 @@ def create_app(
         # Fix host header for Google if necessary
         if "host" in headers:
             del headers["host"]
-            
-        client: httpx.AsyncClient = request.app.state.client
-        
-        # Determine upstream URL for Gemini
-        gemini_upstream = os.environ.get("GOOGLE_VERTEX_BASE_URL") or os.environ.get("GOOGLE_GEMINI_BASE_URL") or "https://generativelanguage.googleapis.com"
-        target_url = f"{gemini_upstream.rstrip('/')}/v1beta/models/{model_id}:streamGenerateContent"
-        
+
+        client: httpx.AsyncClient = request.app.state.gemini_client
+
+        target_url = f"{gemini_upstream_url.rstrip('/')}/v1beta/models/{model_id}:streamGenerateContent"
+
         # Forward query params (like API key)
         if request.url.query:
             target_url += f"?{request.url.query}"
@@ -361,7 +425,7 @@ def create_app(
 def _forward_headers(request: Any) -> dict[str, str]:
     """Extract auth and protocol headers from the client request."""
     headers: dict[str, str] = {}
-    for key in ("authorization", "x-api-key", "anthropic-version",
+    for key in ("authorization", "x-api-key", "x-goog-api-key", "anthropic-version",
                  "anthropic-beta", "content-type"):
         val = request.headers.get(key)
         if val:
@@ -576,13 +640,15 @@ def _log_request_summary_from_telemetry(t: TurnTelemetry) -> None:
 
 def serve(
     port: int | None = None,
-    upstream: str = "https://api.anthropic.com",
+    upstream: str | None = None,
+    gemini_upstream: str | None = None,
     data_dir: str | None = None,
     context_limit: int = 200_000,
 ) -> None:
     """Start the tinkuy gateway server.
 
-    Prints the ANTHROPIC_BASE_URL for copy-paste convenience.
+    Both Anthropic and Gemini routes are always active.  Upstream
+    URLs resolve from explicit args > env vars > defaults.
     """
     try:
         import uvicorn
@@ -611,10 +677,20 @@ def serve(
         enable_event_log=True,
     )
 
-    app = create_app(gateway_config=config, upstream=upstream)
+    app = create_app(
+        gateway_config=config,
+        upstream=upstream,
+        gemini_upstream=gemini_upstream,
+    )
 
+    anthropic_url = _resolve_upstream("anthropic", upstream)
+    gemini_url = _resolve_upstream("gemini", gemini_upstream)
     base_url = f"http://127.0.0.1:{port}"
+
     print(f"\n  tinkuy gateway listening on {base_url}", file=sys.stderr)
-    print(f"\n  export ANTHROPIC_BASE_URL={base_url}\n", file=sys.stderr)
+    print(f"  anthropic upstream: {anthropic_url}", file=sys.stderr)
+    print(f"  gemini upstream:    {gemini_url}", file=sys.stderr)
+    print(f"\n  export ANTHROPIC_BASE_URL={base_url}", file=sys.stderr)
+    print(f"  export GOOGLE_GEMINI_BASE_URL={base_url}\n", file=sys.stderr)
 
     uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")

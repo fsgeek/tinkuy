@@ -313,7 +313,11 @@ def test_live_synthesize_messages_merges_consecutive_same_role_messages():
     live = LiveAdapter(Orchestrator(projection=projection))
     payload = live.synthesize_messages()
 
-    assert payload["messages"] == [{"role": "user", "content": "u1\nu2"}]
+    # Consecutive same-role messages merge into a content block list
+    assert payload["messages"] == [{"role": "user", "content": [
+        {"type": "text", "text": "u1"},
+        {"type": "text", "text": "u2"},
+    ]}]
 
 
 def test_live_synthesize_messages_starts_with_user_when_first_message_is_assistant():

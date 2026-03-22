@@ -71,7 +71,11 @@ def test_extract_user_content_parses_content_blocks_and_tool_results():
     user_content, tool_results = gw_mod._extract_user_content(messages)
 
     assert user_content == "please use tool"
-    assert tool_results == [{"content": "alpha beta", "name": "toolu_123"}]
+    assert tool_results == [{
+        "content": "alpha beta",
+        "name": "toolu_123",
+        "metadata": {"tool_use_id": "toolu_123", "is_error": False},
+    }]
 
 
 def test_extract_response_text_reads_anthropic_text_blocks():

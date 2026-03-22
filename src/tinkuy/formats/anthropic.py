@@ -154,8 +154,29 @@ class LiveAdapter:
             }
 
         if block.kind == ContentKind.TOOL_RESULT:
-            role = "user"  # Tool results are in user turns
-        elif block.kind == ContentKind.CONVERSATION:
+            # Tool results must be structured for the Anthropic API.
+            # The tool_use_id is preserved in block metadata.
+            tool_use_id = block.metadata.get("tool_use_id", block.label)
+            result_content = block.content
+            if block.status == ContentStatus.AVAILABLE:
+                result_content = (
+                    f"[tensor:{block.handle[:8]} — evicted tool result]"
+                )
+            tool_result_block: dict[str, Any] = {
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": result_content,
+            }
+            if block.metadata.get("is_error"):
+                tool_result_block["is_error"] = True
+            return {
+                "role": "user",
+                "content": [tool_result_block],
+                "_region": region.name,
+                "_handle": block.handle,
+            }
+
+        if block.kind == ContentKind.CONVERSATION:
             # Infer role from label or default based on position
             role = "assistant" if "assistant" in block.label else "user"
         elif block.kind == ContentKind.FILE:
@@ -212,12 +233,27 @@ class LiveAdapter:
             content = msg["content"]
 
             if result and result[-1]["role"] == role:
-                # Merge consecutive same-role messages
+                # Merge consecutive same-role messages.
+                # Content may be str or list (content blocks).  When
+                # either side is a list (e.g. tool_result blocks),
+                # merge into a unified content-block list so the API
+                # sees valid structured content.
                 prev = result[-1]
-                if isinstance(prev["content"], str):
-                    prev["content"] = prev["content"] + "\n" + content
+                prev_content = prev["content"]
+                new_content = content
+
+                # Normalize both sides to lists
+                if isinstance(prev_content, str):
+                    prev_content = [{"type": "text", "text": prev_content}]
+                if isinstance(new_content, str):
+                    new_content = [{"type": "text", "text": new_content}]
+
+                if isinstance(prev_content, list) and isinstance(new_content, list):
+                    prev["content"] = prev_content + new_content
                 else:
-                    prev["content"] = str(prev["content"]) + "\n" + content
+                    # Fallback — should not happen
+                    prev["content"] = str(prev_content) + "\n" + str(new_content)
+
                 # Preserve cache hint: if either message is durable, keep it
                 if "_cache_control" in msg and "_cache_control" not in prev:
                     prev["_cache_control"] = msg["_cache_control"]

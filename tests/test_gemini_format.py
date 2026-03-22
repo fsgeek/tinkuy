@@ -9,7 +9,7 @@ from tinkuy.formats.gemini import (
     GeminiLiveAdapter,
     GeminiResponseIngester,
 )
-from tinkuy.gateway import APIFormat, Gateway
+from tinkuy.gateway import Gateway
 from tinkuy.orchestrator import (
     EventType,
     InboundEvent,
@@ -236,12 +236,12 @@ def test_gemini_response_ingester_returns_none_without_candidates():
     assert GeminiResponseIngester(Orchestrator()).ingest_response({}) is None
 
 
-def test_gateway_prepare_gemini_request_sets_format_and_synthesizes_payload():
+def test_gateway_prepare_gemini_request_synthesizes_payload():
     gateway = Gateway()
 
-    # Verify format switch behavior.
+    # Both formats work on the same gateway — format is per-request,
+    # not gateway state.
     gateway.prepare_request({"messages": [{"role": "user", "content": "hi"}]})
-    assert gateway.config.format == APIFormat.ANTHROPIC
 
     upstream = gateway.prepare_gemini_request(
         {
@@ -253,7 +253,6 @@ def test_gateway_prepare_gemini_request_sets_format_and_synthesizes_payload():
         }
     )
 
-    assert gateway.config.format == APIFormat.GEMINI
     assert upstream["model"] == "gemini-2.5-pro"
     assert upstream["temperature"] == 0.2
     assert "contents" in upstream
