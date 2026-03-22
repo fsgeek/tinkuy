@@ -376,6 +376,17 @@ class Gateway:
         # placement internally, respecting tool_result ordering.
         payload = self._anthropic_live.synthesize_messages()
         self._inject_memory_protocol(payload)
+
+        # Pre-flight validation — catch layout violations before the wire
+        from tinkuy.formats.validate import validate_anthropic_payload
+        validation = validate_anthropic_payload(payload)
+        if not validation.valid:
+            for err in validation.errors:
+                loc = f" at {err.location}" if err.location else ""
+                log.error("PREFLIGHT [%s]%s: %s", err.rule, loc, err.message)
+            # Log but don't block — we want to see what the API says too
+            # TODO: consider raising after confidence in the validator grows
+
         return payload
 
     def ingest_response(
