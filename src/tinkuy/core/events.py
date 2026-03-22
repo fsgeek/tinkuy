@@ -36,6 +36,7 @@ class EventKind(Enum):
     CANDIDATE_SCORED = auto()
     EVICTION_DECIDED = auto()
     EVICTION_EXECUTED = auto()
+    PROJECTION_DISPATCHED = auto()  # content sent to Hamutay projector
 
     # Cooperative signals
     SIGNAL_RELEASE = auto()

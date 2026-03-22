@@ -315,10 +315,8 @@ class Orchestrator:
         future = self._projection_executor.submit(_project)
         self._pending_projections[handle] = future
         self._emit(
-            EventKind.BLOCK_CREATED,  # reuse; TODO: add PROJECTION_DISPATCHED
+            EventKind.PROJECTION_DISPATCHED,
             handle=handle,
-            content_kind="PROJECTION_DISPATCHED",
-            region="SIDECAR",
             label=f"projector:{handle[:8]}",
             size_tokens=len(content) // 4,
         )
@@ -463,6 +461,51 @@ class Orchestrator:
         if self._page_store is not None:
             return self._page_store.get(handle)
         return None
+
+    def _evict_with_stored_tensor(
+        self,
+        block: ContentBlock,
+        handle: str,
+        tensor_data: dict[str, Any],
+    ) -> None:
+        """Evict a block using a tensor already in the store.
+
+        This is the fast path: the tensor was produced in a prior session
+        (or earlier in this one) and persisted. We skip the projector
+        entirely and go straight to eviction.
+        """
+        # Persist the verbatim original before evicting
+        if block.content:
+            self._persist_page(handle, block.content)
+
+        # Build the R2 stub — same shape as _drain_projections produces
+        n_strands = len(tensor_data.get("strands", []))
+        n_losses = len(tensor_data.get("declared_losses", []))
+        tensor_block = ContentBlock.create(
+            content=f"[tensor:{handle[:8]} — {n_strands} strands, "
+                    f"{n_losses} losses]",
+            kind=ContentKind.TENSOR,
+            label=f"tensor:{handle[:8]}",
+            region=RegionID.DURABLE,
+            turn=self.turn,
+        )
+        tensor_block.metadata["source_handle"] = handle
+        tensor_block.metadata["n_strands"] = n_strands
+        tensor_block.metadata["source"] = "store"
+
+        self.projection.evict(handle, tensor_block)
+        self._emit(
+            EventKind.BLOCK_EVICTED,
+            handle=handle,
+            tensor_handle=tensor_block.handle,
+            source="store",
+        )
+        log.info(
+            "evicted %s using stored tensor (%d strands, %d losses)",
+            handle[:8],
+            n_strands,
+            n_losses,
+        )
 
     @classmethod
     def from_checkpoint(
@@ -790,7 +833,22 @@ class Orchestrator:
             if decision.handle is None:
                 continue
 
-            match decision.action:
+            # Check if the tensor store already has a tensor for this handle.
+            # If so, upgrade REQUEST/DEMAND to EVICT — no projector call needed.
+            action = decision.action
+            if (
+                action in (EvictionAction.REQUEST_TENSOR, EvictionAction.DEMAND_TENSOR)
+                and self._tensor_store is not None
+                and self._tensor_store.has(decision.handle)
+            ):
+                action = EvictionAction.EVICT
+                log.info(
+                    "tensor store hit for %s — upgrading %s to EVICT",
+                    decision.handle[:8],
+                    decision.action.name,
+                )
+
+            match action:
                 case EvictionAction.REQUEST_TENSOR | EvictionAction.DEMAND_TENSOR:
                     # Mark block as pending removal
                     for region in self.projection.regions.values():
@@ -811,10 +869,21 @@ class Orchestrator:
                             break
 
                 case EvictionAction.EVICT:
-                    # Direct eviction — block already has a tensor
+                    # Direct eviction — tensor available (in block or store)
                     for region in self.projection.regions.values():
                         block = region.find(decision.handle)
-                        if block and block.tensor_handle is not None:
+                        if block is None:
+                            continue
+                        # If the block doesn't have a tensor_handle yet but
+                        # the store does, ingest the stored tensor now.
+                        if block.tensor_handle is None and self._tensor_store is not None:
+                            tensor_data = self._tensor_store.get(decision.handle)
+                            if tensor_data is not None:
+                                self._evict_with_stored_tensor(
+                                    block, decision.handle, tensor_data
+                                )
+                                break
+                        if block.tensor_handle is not None:
                             block.status = ContentStatus.AVAILABLE
                             block.content = ""
                             break
