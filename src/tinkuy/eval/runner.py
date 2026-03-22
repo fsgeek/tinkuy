@@ -26,12 +26,26 @@ from tinkuy.gateway import Gateway, GatewayConfig
 log = logging.getLogger(__name__)
 
 
-def _make_gateway(context_limit: int = 200_000) -> Gateway:
-    """Create a fresh gateway with no prior state."""
+def _make_gateway(
+    context_limit: int = 200_000,
+    use_projector: bool = False,
+    projector_model: str = "claude-haiku-4-5-20251001",
+) -> Gateway:
+    """Create a fresh gateway with no prior state.
+
+    When use_projector=True, attaches a Hamutay Projector sidecar
+    for system-initiated tensor production during eviction.
+    """
+    projector = None
+    if use_projector:
+        from hamutay.projector import Projector
+        projector = Projector(model=projector_model)
+
     config = GatewayConfig(
         context_limit=context_limit,
         enable_console=False,
         enable_event_log=True,
+        projector=projector,
     )
     return Gateway(config)
 
@@ -42,6 +56,8 @@ async def run_task(
     modes: list[str],
     context_limit: int = 200_000,
     max_tokens: int = 4096,
+    use_projector: bool = False,
+    projector_model: str = "claude-haiku-4-5-20251001",
 ) -> dict[str, Transcript]:
     """Run a task in multiple modes, return transcripts keyed by mode."""
     results: dict[str, Transcript] = {}
@@ -50,7 +66,13 @@ async def run_task(
         log.info("--- running %s in mode=%s ---", task.name, mode)
 
         # Fresh gateway per run — no contamination between modes
-        gw = _make_gateway(context_limit)
+        # Projector only attaches for non-baseline modes
+        attach_projector = use_projector and mode != "baseline"
+        gw = _make_gateway(
+            context_limit,
+            use_projector=attach_projector,
+            projector_model=projector_model,
+        )
         driver = ConversationDriver(
             gateway=gw,
             model=model,
@@ -58,14 +80,21 @@ async def run_task(
         )
 
         transcript = await driver.run(task, mode=mode)
+
+        # Record projector config in transcript metadata
+        transcript.config["use_projector"] = attach_projector
+        if attach_projector:
+            transcript.config["projector_model"] = projector_model
+
         results[mode] = transcript
 
         log.info(
-            "completed %s/%s: %d turns, final pressure=%s",
+            "completed %s/%s: %d turns, final pressure=%s, projector=%s",
             task.name,
             mode,
             len(transcript.turns),
             transcript.turns[-1].pressure_zone if transcript.turns else "N/A",
+            "yes" if attach_projector else "no",
         )
 
     return results
@@ -133,6 +162,16 @@ def main() -> None:
         default="eval_results",
         help="Output directory for transcripts (default: eval_results)",
     )
+    parser.add_argument(
+        "--projector",
+        action="store_true",
+        help="Attach Hamutay Projector sidecar for system-initiated tensor production",
+    )
+    parser.add_argument(
+        "--projector-model",
+        default="claude-haiku-4-5-20251001",
+        help="Model for the projector sidecar (default: claude-haiku-4-5-20251001)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -152,6 +191,8 @@ def main() -> None:
             modes=modes,
             context_limit=args.context_limit,
             max_tokens=args.max_tokens,
+            use_projector=args.projector,
+            projector_model=args.projector_model,
         )
     )
 

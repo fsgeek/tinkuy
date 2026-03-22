@@ -1,6 +1,6 @@
-"""Persistence layer for projection state and page store.
+"""Persistence layer for projection state, page store, and tensor store.
 
-Two concerns, two different write strategies:
+Three concerns, three different write strategies:
 
 1. Page store (verbatim originals) — written eagerly at eviction time.
    If we crash before persisting, the content is gone forever. These
@@ -10,8 +10,14 @@ Two concerns, two different write strategies:
    This is the full projection state (regions, blocks, metadata).
    It's a snapshot: each write replaces the previous one.
 
-Both use a Store protocol so backends can vary (filesystem, SQLite,
-S3, etc.) without the orchestrator knowing or caring.
+3. Tensor store — create-only. Tensors are immutable once written.
+   The sole mutation operation is create. When backed by Yanantin,
+   this becomes the creche where tensors live forever. Locally,
+   it's append-only JSONL or individual files — same semantics,
+   cheaper infrastructure.
+
+All use Store protocols so backends can vary (filesystem, Yanantin,
+SQLite, S3, etc.) without the orchestrator knowing or caring.
 """
 
 from __future__ import annotations
@@ -66,6 +72,41 @@ class CheckpointStore(Protocol):
         ...
 
 
+class TensorStore(Protocol):
+    """Protocol for immutable tensor storage.
+
+    The sole mutation operation is create. Tensors are never modified
+    or deleted. This is the contract that Yanantin enforces at the
+    database level; local implementations honor it by convention.
+
+    The store accepts and returns tensor data as dicts (the serialized
+    form of Hamutay's Tensor model). This keeps the protocol independent
+    of the Tensor class — Tinkuy can store tensors without importing
+    Hamutay's models, and Yanantin can store tensors from any source.
+
+    Handles are content-addressed (8-char hex from SHA-256 of the
+    content that was evicted to produce the tensor). The tensor_handle
+    in R2 ContentBlocks points here.
+    """
+
+    def create(self, handle: str, tensor: dict[str, Any]) -> None:
+        """Store a tensor. Immutable — writing the same handle twice
+        is a no-op, not an error. The first write wins."""
+        ...
+
+    def get(self, handle: str) -> dict[str, Any] | None:
+        """Retrieve a tensor by handle. Returns None if not found."""
+        ...
+
+    def has(self, handle: str) -> bool:
+        """Check if a tensor exists without retrieving it."""
+        ...
+
+    def handles(self) -> list[str]:
+        """List all stored tensor handles."""
+        ...
+
+
 # --- Filesystem implementations ---
 
 
@@ -107,6 +148,48 @@ class FilePageStore:
     def handles(self) -> list[str]:
         return [
             p.stem for p in self.directory.glob("*.page")
+        ]
+
+
+class FileTensorStore:
+    """Tensor store backed by individual JSON files on disk.
+
+    Each tensor is written to its own file, named by handle. Writes
+    are atomic (temp-then-rename). Once written, a tensor is never
+    modified — writing the same handle again is silently ignored.
+    """
+
+    def __init__(self, directory: str | Path) -> None:
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+
+    def _path(self, handle: str) -> Path:
+        return self.directory / f"{handle}.tensor.json"
+
+    def create(self, handle: str, tensor: dict[str, Any]) -> None:
+        path = self._path(handle)
+        if path.exists():
+            return  # Immutable — first write wins
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(tensor, indent=2, default=str),
+            encoding="utf-8",
+        )
+        os.replace(str(tmp), str(path))
+
+    def get(self, handle: str) -> dict[str, Any] | None:
+        path = self._path(handle)
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+        return None
+
+    def has(self, handle: str) -> bool:
+        return self._path(handle).exists()
+
+    def handles(self) -> list[str]:
+        return [
+            p.stem.removesuffix(".tensor")
+            for p in self.directory.glob("*.tensor.json")
         ]
 
 
@@ -165,6 +248,30 @@ class MemoryPageStore:
 
     def handles(self) -> list[str]:
         return list(self._pages.keys())
+
+
+class MemoryTensorStore:
+    """In-memory tensor store for testing.
+
+    Honors the immutability contract: create is a no-op if the
+    handle already exists.
+    """
+
+    def __init__(self) -> None:
+        self._tensors: dict[str, dict[str, Any]] = {}
+
+    def create(self, handle: str, tensor: dict[str, Any]) -> None:
+        if handle not in self._tensors:
+            self._tensors[handle] = tensor
+
+    def get(self, handle: str) -> dict[str, Any] | None:
+        return self._tensors.get(handle)
+
+    def has(self, handle: str) -> bool:
+        return handle in self._tensors
+
+    def handles(self) -> list[str]:
+        return list(self._tensors.keys())
 
 
 class MemoryCheckpointStore:
