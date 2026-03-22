@@ -8,3 +8,8 @@ build/
 *.bak
 .tinkuy-data/
 .serena/
+eval_results*/
+*.log
+response.json
+status.json
+CONTINUITY.md

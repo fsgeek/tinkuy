@@ -89,7 +89,7 @@ from tinkuy.core.orchestrator import (
     TurnRecord,
 )
 from tinkuy.core.pressure import PressureZone
-from tinkuy.core.regions import ContentKind, Projection, RegionID
+from tinkuy.core.regions import Projection
 from tinkuy.core.store import (
     CheckpointStore,
     FileCheckpointStore,
@@ -99,7 +99,6 @@ from tinkuy.core.store import (
     MemoryPageStore,
     MemoryTensorStore,
     PageStore,
-    TensorStore,
 )
 from tinkuy.formats.anthropic import LiveAdapter as AnthropicLiveAdapter
 from tinkuy.formats.gemini import (
