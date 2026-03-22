@@ -169,6 +169,9 @@ def test_pressure_zone_property_and_page_table_method():
     gateway = Gateway()
     gateway.process_turn("add current")
     gateway.ingest_response("assistant response")
+    # Second turn ages first turn's content from R4 to R3, making it
+    # visible in the page table (which only covers R2 and R3).
+    gateway.process_turn("second turn")
 
     zone = gateway.pressure_zone
     table = gateway.page_table()

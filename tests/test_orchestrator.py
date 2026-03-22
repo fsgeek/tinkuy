@@ -80,7 +80,7 @@ def test_ingest_response_stores_assistant_content_in_r3_and_updates_record():
 
     assert updated is turn_record
     assert updated.response_handle is not None
-    response_block = orch.projection.region(RegionID.EPHEMERAL).find(updated.response_handle)
+    response_block = orch.projection.region(RegionID.CURRENT).find(updated.response_handle)
     assert response_block is not None
     assert response_block.content == "assistant text"
     assert response_block.kind == ContentKind.CONVERSATION
@@ -295,6 +295,6 @@ def test_full_begin_turn_to_ingest_response_cycle_with_decision_application():
         assert block.tensor_handle is not None
         assert orch.projection.region(RegionID.DURABLE).find(block.tensor_handle) is not None
 
-    response = orch.projection.region(RegionID.EPHEMERAL).find(after.response_handle)
+    response = orch.projection.region(RegionID.CURRENT).find(after.response_handle)
     assert response is not None
     assert response.content == "assistant follow-up"

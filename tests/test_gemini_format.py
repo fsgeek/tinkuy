@@ -212,7 +212,7 @@ def test_gemini_response_ingester_ingests_content_and_extracts_signals():
     assert ResponseSignalType.RELEASE in signal_types
     assert ResponseSignalType.RECALL in signal_types
 
-    response_block = orch.projection.region(RegionID.EPHEMERAL).find(record.response_handle)
+    response_block = orch.projection.region(RegionID.CURRENT).find(record.response_handle)
     assert response_block is not None
     assert response_block.content == "Visible answer"
 
@@ -286,6 +286,6 @@ def test_gateway_ingest_gemini_response_ingests_assistant_turn():
 
     assert record is not None
     assert record.response_handle is not None
-    response_block = gateway.projection.region(RegionID.EPHEMERAL).find(record.response_handle)
+    response_block = gateway.projection.region(RegionID.CURRENT).find(record.response_handle)
     assert response_block is not None
     assert response_block.content == "assistant answer"

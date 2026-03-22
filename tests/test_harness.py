@@ -194,9 +194,9 @@ Answer body for user.
     assert len(api_client.payloads) == 1
 
     assert harness.gateway.turn == 1
-    ephemeral_blocks = harness.gateway.projection.region(RegionID.EPHEMERAL).blocks
-    assert ephemeral_blocks
-    assert ephemeral_blocks[-1].content == clean_response
+    current_blocks = harness.gateway.projection.region(RegionID.CURRENT).blocks
+    assert current_blocks
+    assert current_blocks[-1].content == clean_response
 
 
 def test_session_harness_run_loops_until_frontend_returns_none():

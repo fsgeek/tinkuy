@@ -158,10 +158,10 @@ def test_ingest_messages_groups_by_turn_and_places_blocks():
     assert [b.content for b in system_blocks] == ["sys"]
 
     current_blocks = orch.projection.region(RegionID.CURRENT).present_blocks()
-    assert [b.content for b in current_blocks] == ["u2"]
+    assert [b.content for b in current_blocks] == ["u2", "a2"]
 
     ephemeral_blocks = orch.projection.region(RegionID.EPHEMERAL).blocks
-    assert [b.content for b in ephemeral_blocks] == ["a1", "u1", "a2"]
+    assert [b.content for b in ephemeral_blocks] == ["u1", "a1"]
 
 
 def test_ingest_anthropic_and_ingest_jsonl():
@@ -189,8 +189,8 @@ def test_ingest_anthropic_and_ingest_jsonl():
 
     assert orch.turn == 2
     assert [b.content for b in orch.projection.region(RegionID.SYSTEM).blocks] == ["sys"]
-    assert [b.content for b in orch.projection.region(RegionID.CURRENT).blocks] == ["u2"]
-    assert [b.content for b in orch.projection.region(RegionID.EPHEMERAL).blocks] == ["a1", "u1", "a2"]
+    assert [b.content for b in orch.projection.region(RegionID.CURRENT).blocks] == ["u2", "a2"]
+    assert [b.content for b in orch.projection.region(RegionID.EPHEMERAL).blocks] == ["u1", "a1"]
 
 
 def test_ingest_file_json_and_jsonl(tmp_path):
@@ -211,8 +211,8 @@ def test_ingest_file_json_and_jsonl(tmp_path):
     ingest_json.ingest_file(raw_path)
 
     assert orch_json.turn == 1
-    assert [b.content for b in orch_json.projection.region(RegionID.CURRENT).blocks] == ["u1"]
-    assert [b.content for b in orch_json.projection.region(RegionID.EPHEMERAL).blocks] == ["a1"]
+    assert [b.content for b in orch_json.projection.region(RegionID.CURRENT).blocks] == ["u1", "a1"]
+    assert [b.content for b in orch_json.projection.region(RegionID.EPHEMERAL).blocks] == []
 
     # .jsonl
     jsonl_path = tmp_path / "conversation.jsonl"
@@ -231,8 +231,8 @@ def test_ingest_file_json_and_jsonl(tmp_path):
     ingest_jsonl_adapter.ingest_file(jsonl_path)
 
     assert orch_jsonl.turn == 1
-    assert [b.content for b in orch_jsonl.projection.region(RegionID.CURRENT).blocks] == ["u2"]
-    assert [b.content for b in orch_jsonl.projection.region(RegionID.EPHEMERAL).blocks] == ["a2"]
+    assert [b.content for b in orch_jsonl.projection.region(RegionID.CURRENT).blocks] == ["u2", "a2"]
+    assert [b.content for b in orch_jsonl.projection.region(RegionID.EPHEMERAL).blocks] == []
 
 
 def test_live_synthesize_messages_uses_system_from_r0_r1_and_valid_alternation():
