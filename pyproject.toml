@@ -2,13 +2,14 @@
 name = "tinkuy"
 version = "0.2.0"
 description = "Virtual memory manager for transformer context windows"
-requires-python = ">=3.10"
+requires-python = ">=3.14"
 dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
 serve = ["fastapi>=0.110", "uvicorn>=0.29", "httpx>=0.27"]
 litellm = ["litellm>=1.0"]
+hamutay = ["hamutay"]
 all = ["tinkuy[serve,litellm]"]
 
 [project.scripts]
@@ -17,6 +18,9 @@ tinkuy = "tinkuy.__main__:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.uv.sources]
+hamutay = { path = "../hamutay", editable = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
