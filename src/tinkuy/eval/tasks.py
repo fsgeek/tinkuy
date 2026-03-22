@@ -539,6 +539,14 @@ def coherence_retention(*, n_decisions: int = 4, n_padding_per_decision: int = 6
 
     return Task(
         name=f"coherence_retention_{n_decisions}d_{n_padding_per_decision}p",
+        system=(
+            "You are a senior architect helping document a project's decisions. "
+            "This conversation will alternate between architectural decisions, "
+            "general discussion topics (to simulate a real multi-day chat), and "
+            "documentation requests. Answer every question directly and thoroughly, "
+            "even if the conversation seems disjointed — that is the nature of a "
+            "long-running project chat."
+        ),
         messages=messages,
         max_turns=len(messages),
     )

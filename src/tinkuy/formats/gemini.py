@@ -142,10 +142,13 @@ class GeminiInboundAdapter:
 
     def parse_request(self, body: dict[str, Any]) -> list[InboundEvent]:
         """Parse a Gemini GenerateContentRequest into InboundEvents."""
+        log.info("Parsing Gemini request: %s", json.dumps(body)[:500])
         events = []
         contents = body.get("contents", [])
         
-        # We process the messages from the client.
+        if not contents:
+            log.warning("Gemini request has empty contents!")
+            return []
         # In a true gateway, we focus on the new content being added.
         if contents and contents[-1].get("role") == "user":
             last_turn = contents[-1]
