@@ -32,9 +32,9 @@ log = logging.getLogger("tinkuy.gateway")
 
 MEMORY_PROTOCOL = """\
 <yuyay-memory-protocol>
-This conversation is managed by Tinkuy, a virtual memory system. The
-<yuyay-page-table> above shows what content is in memory, including
-evicted blocks that can be recalled.
+This conversation is managed by Tinkuy, a virtual memory system. Each
+turn includes a <yuyay-page-table> showing what content is in memory,
+including evicted blocks that can be recalled.
 
 You can emit cooperative memory signals inside <yuyay-response> blocks.
 These are metadata — they will be stripped from your visible response.
@@ -560,17 +560,32 @@ class Gateway:
     def _inject_page_table(
         self, payload: dict[str, Any], page_table: str
     ) -> None:
-        """Inject the page table into the system prompt."""
-        system = payload.get("system", [])
-        if isinstance(system, list):
-            system.append({
-                "type": "text",
-                "text": page_table,
-                "cache_control": {"type": "ephemeral"},
-            })
-            payload["system"] = system
-        elif isinstance(system, str):
-            payload["system"] = system + "\n\n" + page_table
+        """Inject the page table into the last user message.
+
+        The page table is per-turn volatile — it must NOT go in the
+        system block or it will bust the entire system prompt cache.
+        Instead, inject it as a content block in the last user message,
+        which is always the current turn (R4) and never cached.
+        """
+        messages = payload.get("messages", [])
+        if not messages:
+            return
+
+        # Find the last user message
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                msg = messages[i]
+                # Normalize content to list form
+                content = msg["content"]
+                if isinstance(content, str):
+                    content = [{"type": "text", "text": content}]
+                # Prepend page table so it's visible before the user's text
+                content.insert(0, {
+                    "type": "text",
+                    "text": page_table,
+                })
+                msg["content"] = content
+                return
 
     def _inject_memory_protocol(self, payload: dict[str, Any]) -> None:
         """Inject the cooperative memory protocol instructions."""
@@ -665,7 +680,15 @@ def _merge_system(
     client_system: Any,
     gateway_system: Any,
 ) -> Any:
-    """Merge client's system prompt with gateway additions."""
+    """Merge client's system prompt with gateway additions.
+
+    The gateway is the cache authority. It places cache_control
+    breakpoints on stable content boundaries. The merge preserves
+    these breakpoints — stripping them would destroy cache hit rate.
+
+    Order: client parts first (stable across turns in practice),
+    then gateway parts (R0/R1 stable, page table volatile).
+    """
     if isinstance(client_system, str):
         client_parts = [{"type": "text", "text": client_system}]
     elif isinstance(client_system, list):
@@ -676,11 +699,11 @@ def _merge_system(
     if isinstance(gateway_system, str):
         gw_parts = [{"type": "text", "text": gateway_system}]
     elif isinstance(gateway_system, list):
-        gw_parts = [{k: v for k, v in p.items() if k != "cache_control"}
-                     for p in gateway_system]
+        gw_parts = list(gateway_system)
     else:
         gw_parts = []
 
+    # Deduplicate — don't repeat content the client already sent
     client_texts = {p.get("text", "") for p in client_parts
                     if isinstance(p, dict)}
     new_parts = [p for p in gw_parts

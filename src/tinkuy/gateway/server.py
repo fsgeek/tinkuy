@@ -177,6 +177,23 @@ def create_app(
             media_type="application/json",
         )
 
+    @app.post("/v1/messages/count_tokens")
+    async def count_tokens(request: Request) -> Response:
+        """Pure passthrough — the gateway never touches token counting."""
+        body = await request.json()
+        headers = _forward_headers(request)
+        upstream_resp = await request.app.state.anthropic_client.post(
+            "/v1/messages/count_tokens",
+            json=body,
+            headers=headers,
+        )
+        log.info("count_tokens | status=%d", upstream_resp.status_code)
+        return Response(
+            content=upstream_resp.content,
+            status_code=upstream_resp.status_code,
+            media_type="application/json",
+        )
+
     @app.post("/v1/messages")
     async def messages(request: Request) -> Response:
         """The gateway path. No exceptions. No fallback. No bypass."""
@@ -188,6 +205,21 @@ def create_app(
             request.headers.get("x-tinkuy-session"), body
         )
         gw = get_gateway(session_id)
+
+        # Defense in depth: if max_tokens=1 and non-streaming, this is
+        # a token-counting probe (Claude Code fallback when count_tokens
+        # 404s). Pass it through without touching the projection.
+        if not is_streaming and body.get("max_tokens") == 1:
+            log.warning("token-counting probe detected — passthrough without projection")
+            headers = _forward_headers(request)
+            upstream_resp = await request.app.state.anthropic_client.post(
+                "/v1/messages", json=body, headers=headers,
+            )
+            return Response(
+                content=upstream_resp.content,
+                status_code=upstream_resp.status_code,
+                media_type="application/json",
+            )
 
         # Gateway owns the transformation — one call, no branching
         upstream_body = gw.prepare_request(body)
