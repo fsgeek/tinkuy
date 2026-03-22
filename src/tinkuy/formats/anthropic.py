@@ -171,6 +171,10 @@ class LiveAdapter:
         # Enforce alternation
         messages = self._enforce_alternation(raw_messages)
 
+        # Repair tool_use/tool_result pairing — strip orphaned tool_use
+        # blocks that don't have matching tool_results in the next message
+        messages = self._repair_tool_pairing(messages)
+
         # Finalize: place cache breakpoint and strip internal annotations
         return self._finalize_messages(messages)
 
@@ -307,6 +311,108 @@ class LiveAdapter:
             result.insert(0, {"role": "user", "content": "[conversation start]"})
 
         return result
+
+    def _repair_tool_pairing(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Strip tool_use blocks that lack matching tool_results.
+
+        The API requires every tool_use in an assistant message to have
+        a matching tool_result in the immediately following user message.
+        When the projection has orphaned tool_use blocks (e.g., from
+        checkpoint restore or bootstrap), strip them to prevent 400s.
+        """
+        import logging
+        log = logging.getLogger(__name__)
+
+        for i, msg in enumerate(messages):
+            if msg.get("role") != "assistant":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+
+            # Collect tool_use IDs in this assistant message
+            tool_use_ids = {
+                b.get("id")
+                for b in content
+                if isinstance(b, dict) and b.get("type") == "tool_use"
+            } - {None}
+
+            if not tool_use_ids:
+                continue
+
+            # Check next message for matching tool_results
+            if i + 1 < len(messages) and messages[i + 1].get("role") == "user":
+                next_content = messages[i + 1].get("content", "")
+                if isinstance(next_content, list):
+                    result_ids = {
+                        b.get("tool_use_id")
+                        for b in next_content
+                        if isinstance(b, dict) and b.get("type") == "tool_result"
+                    } - {None}
+                else:
+                    result_ids = set()
+            else:
+                result_ids = set()
+
+            # Strip orphaned tool_use blocks
+            orphaned = tool_use_ids - result_ids
+            if orphaned:
+                log.warning(
+                    "stripping %d orphaned tool_use blocks at messages[%d]: %s",
+                    len(orphaned), i, orphaned,
+                )
+                msg["content"] = [
+                    b for b in content
+                    if not (
+                        isinstance(b, dict)
+                        and b.get("type") == "tool_use"
+                        and b.get("id") in orphaned
+                    )
+                ]
+                # If content is now empty or only has empty text, use placeholder
+                if not msg["content"] or all(
+                    isinstance(b, dict) and b.get("type") == "text" and not b.get("text", "").strip()
+                    for b in msg["content"]
+                    if isinstance(b, dict)
+                ):
+                    msg["content"] = "[tool calls omitted]"
+
+        # Ensure tool_result blocks come first in user messages that
+        # follow tool_use. Content from different regions (R3/R4) can
+        # get merged by alternation enforcement with wrong ordering.
+        for i, msg in enumerate(messages):
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+
+            # Check if previous message has tool_use
+            if i > 0 and messages[i - 1].get("role") == "assistant":
+                prev_content = messages[i - 1].get("content", "")
+                has_tool_use = (
+                    isinstance(prev_content, list)
+                    and any(
+                        isinstance(b, dict) and b.get("type") == "tool_use"
+                        for b in prev_content
+                    )
+                )
+                if has_tool_use:
+                    # Partition: tool_results first, everything else after
+                    tool_results = [
+                        b for b in content
+                        if isinstance(b, dict) and b.get("type") == "tool_result"
+                    ]
+                    rest = [
+                        b for b in content
+                        if not (isinstance(b, dict) and b.get("type") == "tool_result")
+                    ]
+                    if tool_results and rest:
+                        msg["content"] = tool_results + rest
+
+        return messages
 
     def _finalize_messages(
         self, messages: list[dict[str, Any]]
