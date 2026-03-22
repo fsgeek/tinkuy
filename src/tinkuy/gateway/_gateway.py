@@ -17,6 +17,8 @@ Three modes of operation:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -88,8 +90,9 @@ from tinkuy.core.orchestrator import (
     ResponseSignalType,
     TurnRecord,
 )
+from tinkuy.core.events import EventKind
 from tinkuy.core.pressure import PressureZone
-from tinkuy.core.regions import Projection
+from tinkuy.core.regions import ContentStatus, Projection
 from tinkuy.core.store import (
     CheckpointStore,
     FileCheckpointStore,
@@ -209,6 +212,13 @@ class Gateway:
         
         self.telemetry: list[TurnTelemetry] = []
         self._client_overhead_tokens: int | None = None
+        self._pending_turn_context: dict[str, Any] | None = None
+        self._telemetry_path: Path | None = None
+        if self.config.data_dir and self.config.session_id:
+            self._telemetry_path = (
+                Path(self.config.data_dir) / "sessions"
+                / self.config.session_id / "telemetry.jsonl"
+            )
 
     def _setup_stores(self) -> None:
         """Initialize page store, checkpoint store, and tensor store.
@@ -443,10 +453,24 @@ class Gateway:
             len(tool_results) if tool_results else 0,
         )
 
+        # Snapshot client request metadata before processing
+        self._pending_turn_context = _capture_client_context(
+            client_body, request_messages,
+        )
+
         turn_result = self.process_turn(
             user_content=user_content or "",
             tool_results=tool_results,
             format=APIFormat.ANTHROPIC,
+        )
+
+        # Snapshot gateway state after processing (projection is updated)
+        self._pending_turn_context["projection"] = (
+            self._snapshot_gateway_state()
+        )
+        # Capture repair counts from the synthesizer
+        self._pending_turn_context["repairs"] = (
+            self._anthropic_live.last_repair_counts
         )
 
         # Build complete upstream body
@@ -465,6 +489,11 @@ class Gateway:
             upstream["system"] = gateway_system
         elif client_system is not None:
             upstream["system"] = client_system
+
+        # Capture wire metadata
+        self._pending_turn_context["wire"] = {
+            "message_count": len(upstream.get("messages", [])),
+        }
 
         return upstream
 
@@ -550,6 +579,125 @@ class Gateway:
             f"{self._client_overhead_tokens:,}"
             if self._client_overhead_tokens is not None else "uncalibrated",
         )
+
+        # Persist the complete turn record
+        self._write_turn_record(telemetry)
+
+    def _snapshot_gateway_state(self) -> dict[str, Any]:
+        """Snapshot the gateway's view of the world for telemetry."""
+        projection = self.orchestrator.projection
+        pressure = self.orchestrator.scheduler.read_pressure(projection)
+        regions: dict[str, Any] = {}
+        for rid, region in projection.regions.items():
+            regions[rid.name] = {
+                "tokens": region.size_tokens,
+                "blocks": len(region.blocks),
+                "waste_tokens": region.waste_tokens,
+                "present": sum(
+                    1 for b in region.blocks
+                    if b.status == ContentStatus.PRESENT
+                ),
+                "evicted": sum(
+                    1 for b in region.blocks
+                    if b.status == ContentStatus.AVAILABLE
+                ),
+            }
+        return {
+            "total_tokens": projection.total_tokens,
+            "waste_tokens": projection.waste_tokens,
+            "regions": regions,
+            "pressure_zone": pressure.zone.name,
+            "usage_ratio": round(pressure.usage, 4),
+            "headroom_tokens": pressure.headroom_tokens,
+            "overhead_estimate": self._client_overhead_tokens,
+            "projected_message_count": None,  # filled by caller after synthesis
+        }
+
+    def _write_turn_record(self, telemetry: TurnTelemetry) -> None:
+        """Append a complete turn record to the session JSONL file."""
+        if self._telemetry_path is None:
+            return
+
+        ctx = self._pending_turn_context or {}
+        self._pending_turn_context = None
+
+        # Collect eviction events from the event log for this turn
+        eviction_data = self._collect_eviction_data()
+
+        record: dict[str, Any] = {
+            "session_id": self.config.session_id,
+            "turn": telemetry.turn,
+            "timestamp": telemetry.timestamp,
+            # Client request metadata
+            "request": ctx.get("request", {}),
+            # Gateway state at request time
+            "projection": ctx.get("projection", {}),
+            # Synthesizer repairs
+            "repairs": ctx.get("repairs", {}),
+            # Wire metadata
+            "wire": {
+                **(ctx.get("wire", {})),
+                "request_bytes": telemetry.request_bytes,
+            },
+            # API response — ground truth
+            "response": {
+                "message_id": telemetry.message_id,
+                "model": telemetry.model,
+                "input_tokens": telemetry.input_tokens,
+                "cache_read_tokens": telemetry.cache_read_tokens,
+                "cache_create_tokens": telemetry.cache_create_tokens,
+                "output_tokens": telemetry.output_tokens,
+                "stop_reason": telemetry.stop_reason,
+                "text_blocks": telemetry.text_blocks,
+                "thinking_blocks": telemetry.thinking_blocks,
+                "tool_use_blocks": telemetry.tool_use_blocks,
+                "tool_names": telemetry.tool_names,
+                "ttfb": telemetry.ttfb,
+                "duration": telemetry.duration,
+            },
+            # Eviction activity
+            "eviction": eviction_data,
+            # Derived — overhead calibration after this turn
+            "overhead_calibrated": self._client_overhead_tokens,
+        }
+
+        # Update projected_message_count from wire data
+        proj = record.get("projection", {})
+        if proj and record["wire"].get("message_count"):
+            proj["projected_message_count"] = record["wire"]["message_count"]
+
+        try:
+            self._telemetry_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._telemetry_path, "a") as f:
+                f.write(json.dumps(record, default=str) + "\n")
+        except OSError:
+            log.warning("failed to write telemetry record", exc_info=True)
+
+    def _collect_eviction_data(self) -> dict[str, Any]:
+        """Collect eviction/fault counts from the event log."""
+        data: dict[str, Any] = {
+            "evictions_this_turn": 0,
+            "faults_this_turn": 0,
+            "evicted_handles": [],
+            "faulted_handles": [],
+        }
+        if self.event_log is None:
+            return data
+
+        for event in self.event_log.events:
+            if event.turn != self.turn:
+                continue
+            if event.kind in (EventKind.EVICTION_EXECUTED, EventKind.BLOCK_EVICTED):
+                data["evictions_this_turn"] += 1
+                handle = event.data.get("handle")
+                if handle:
+                    data["evicted_handles"].append(handle)
+            elif event.kind == EventKind.BLOCK_RECALLED:
+                data["faults_this_turn"] += 1
+                handle = event.data.get("handle")
+                if handle:
+                    data["faulted_handles"].append(handle)
+        return data
 
     @property
     def calibrated_total_tokens(self) -> int:
@@ -808,3 +956,70 @@ def _extract_response_content_from_json(
                 "input": block.get("input", {}),
             })
     return "\n".join(text_parts), content_blocks
+
+
+def _capture_client_context(
+    client_body: dict[str, Any],
+    messages: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Capture client request metadata for telemetry.
+
+    Hashes large structures (tools, system) instead of storing them.
+    This is the 'what came in' side of the research record.
+    """
+    # Hash tools array
+    tools = client_body.get("tools")
+    tools_hash = None
+    tools_count = 0
+    if tools and isinstance(tools, list):
+        tools_count = len(tools)
+        tools_hash = hashlib.sha256(
+            json.dumps(tools, sort_keys=True, default=str).encode()
+        ).hexdigest()[:16]
+
+    # Hash system prompt
+    system = client_body.get("system")
+    system_hash = None
+    system_token_estimate = 0
+    if system:
+        system_str = system
+        if isinstance(system, list):
+            system_str = json.dumps(system, default=str)
+        elif not isinstance(system, str):
+            system_str = str(system)
+        system_hash = hashlib.sha256(
+            system_str.encode() if isinstance(system_str, str)
+            else system_str
+        ).hexdigest()[:16]
+        # Rough token estimate: ~4 chars per token
+        system_token_estimate = len(system_str) // 4
+
+    return {
+        "request": {
+            "model": client_body.get("model"),
+            "max_tokens": client_body.get("max_tokens"),
+            "stream": client_body.get("stream"),
+            "effort": (
+                client_body.get("output_config", {}).get("effort")
+                if isinstance(client_body.get("output_config"), dict)
+                else None
+            ),
+            "thinking": client_body.get("thinking"),
+            "context_management": client_body.get("context_management"),
+            "client_message_count": len(messages),
+            "tools_hash": tools_hash,
+            "tools_count": tools_count,
+            "system_hash": system_hash,
+            "system_token_estimate": system_token_estimate,
+            # Non-standard fields the client sends
+            "extra_fields": [
+                k for k in client_body
+                if k not in {
+                    "model", "messages", "system", "tools", "max_tokens",
+                    "stream", "temperature", "top_p", "top_k",
+                    "stop_sequences", "metadata", "tool_choice",
+                    "thinking", "context_management", "output_config",
+                }
+            ],
+        },
+    }

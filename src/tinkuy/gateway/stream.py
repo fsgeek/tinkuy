@@ -252,9 +252,10 @@ class MessageReconstructor:
         if usage:
             for k, v in usage.items():
                 if isinstance(v, int):
-                    self._message.usage[k] = (
-                        self._message.usage.get(k, 0) + v
-                    )
+                    # Set, don't accumulate — input tokens are reported
+                    # once at message_start and must not be double-counted
+                    # if also present in message_delta.
+                    self._message.usage[k] = v
         self._state = _ReconstructorState.STREAMING
 
     def _on_content_block_start(self, event: SSEEvent) -> None:
@@ -330,9 +331,9 @@ class MessageReconstructor:
         if usage:
             for k, v in usage.items():
                 if isinstance(v, int):
-                    self._message.usage[k] = (
-                        self._message.usage.get(k, 0) + v
-                    )
+                    # Set, don't accumulate — usage fields are final
+                    # counts, not incremental deltas.
+                    self._message.usage[k] = v
 
     def _on_message_stop(self, event: SSEEvent) -> None:
         self._state = _ReconstructorState.COMPLETE

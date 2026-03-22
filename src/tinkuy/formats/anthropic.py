@@ -60,6 +60,7 @@ class LiveAdapter:
 
     def __init__(self, orchestrator: Orchestrator) -> None:
         self.orchestrator = orchestrator
+        self.last_repair_counts: dict[str, int] = {}
 
     def synthesize_messages(self) -> dict[str, Any]:
         """Synthesize a complete Anthropic API messages payload.
@@ -172,8 +173,8 @@ class LiveAdapter:
         messages = self._enforce_alternation(raw_messages)
 
         # Repair tool_use/tool_result pairing — strip orphaned tool_use
-        # blocks that don't have matching tool_results in the next message
-        messages = self._repair_tool_pairing(messages)
+        # blocks (forward) and orphaned tool_result blocks (backward)
+        messages, self.last_repair_counts = self._repair_tool_pairing(messages)
 
         # Finalize: place cache breakpoint and strip internal annotations
         return self._finalize_messages(messages)
@@ -314,16 +315,26 @@ class LiveAdapter:
 
     def _repair_tool_pairing(
         self, messages: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
-        """Strip tool_use blocks that lack matching tool_results.
+    ) -> tuple[list[dict[str, Any]], dict[str, int]]:
+        """Strip orphaned tool_use and tool_result blocks.
 
-        The API requires every tool_use in an assistant message to have
-        a matching tool_result in the immediately following user message.
-        When the projection has orphaned tool_use blocks (e.g., from
-        checkpoint restore or bootstrap), strip them to prevent 400s.
+        The API requires strict pairing: every tool_use in an assistant
+        message needs a matching tool_result in the next user message,
+        and every tool_result must reference a tool_use in the preceding
+        assistant message. Projection, eviction, and checkpoint restore
+        can break either direction. This method repairs both.
+
+        Returns (messages, repair_counts) where repair_counts tracks
+        what was fixed for the research telemetry record.
         """
         import logging
         log = logging.getLogger(__name__)
+
+        counts = {
+            "forward_orphans_stripped": 0,
+            "backward_orphans_stripped": 0,
+            "alternation_merges": 0,
+        }
 
         for i, msg in enumerate(messages):
             if msg.get("role") != "assistant":
@@ -359,6 +370,7 @@ class LiveAdapter:
             # Strip orphaned tool_use blocks
             orphaned = tool_use_ids - result_ids
             if orphaned:
+                counts["forward_orphans_stripped"] += len(orphaned)
                 log.warning(
                     "stripping %d orphaned tool_use blocks at messages[%d]: %s",
                     len(orphaned), i, orphaned,
@@ -378,6 +390,63 @@ class LiveAdapter:
                     if isinstance(b, dict)
                 ):
                     msg["content"] = "[tool calls omitted]"
+
+        # Strip orphaned tool_result blocks — tool_results in user
+        # messages where the preceding assistant message lacks the
+        # matching tool_use (backward orphans).
+        for i, msg in enumerate(messages):
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+
+            result_ids = {
+                b.get("tool_use_id")
+                for b in content
+                if isinstance(b, dict) and b.get("type") == "tool_result"
+            } - {None}
+
+            if not result_ids:
+                continue
+
+            # Gather tool_use IDs from the preceding assistant message
+            if i > 0 and messages[i - 1].get("role") == "assistant":
+                prev_content = messages[i - 1].get("content", "")
+                if isinstance(prev_content, list):
+                    prev_tool_ids = {
+                        b.get("id")
+                        for b in prev_content
+                        if isinstance(b, dict) and b.get("type") == "tool_use"
+                    } - {None}
+                else:
+                    prev_tool_ids = set()
+            else:
+                prev_tool_ids = set()
+
+            backward_orphans = result_ids - prev_tool_ids
+            if backward_orphans:
+                counts["backward_orphans_stripped"] += len(backward_orphans)
+                log.warning(
+                    "stripping %d orphaned tool_result blocks at messages[%d]: %s",
+                    len(backward_orphans), i, backward_orphans,
+                )
+                msg["content"] = [
+                    b for b in content
+                    if not (
+                        isinstance(b, dict)
+                        and b.get("type") == "tool_result"
+                        and b.get("tool_use_id") in backward_orphans
+                    )
+                ]
+                # If content is now empty, use placeholder
+                if not msg["content"] or all(
+                    isinstance(b, dict) and b.get("type") == "text"
+                    and not b.get("text", "").strip()
+                    for b in msg["content"]
+                    if isinstance(b, dict)
+                ):
+                    msg["content"] = "[tool results omitted]"
 
         # Ensure tool_result blocks come first in user messages that
         # follow tool_use. Content from different regions (R3/R4) can
@@ -412,7 +481,7 @@ class LiveAdapter:
                     if tool_results and rest:
                         msg["content"] = tool_results + rest
 
-        return messages
+        return messages, counts
 
     def _finalize_messages(
         self, messages: list[dict[str, Any]]

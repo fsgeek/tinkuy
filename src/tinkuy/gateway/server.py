@@ -227,6 +227,15 @@ def create_app(
         # Forward auth headers — we never touch credentials
         headers = _forward_headers(request)
 
+        # Stash request headers in pending telemetry context
+        if gw._pending_turn_context is not None:
+            gw._pending_turn_context["request"]["beta_headers"] = (
+                headers.get("anthropic-beta", "")
+            )
+            gw._pending_turn_context["request"]["anthropic_version"] = (
+                headers.get("anthropic-version", "")
+            )
+
         _log_message_structure(upstream_body)
         log.info(
             "  headers | version=%s beta=%s",
