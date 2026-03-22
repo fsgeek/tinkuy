@@ -6,21 +6,30 @@ eviction. It does NOT talk to the API or client directly — adapters
 do that. The orchestrator speaks only in projection mutations and
 eviction decisions.
 
+When a Projector sidecar is configured, the orchestrator dispatches
+eviction candidates to it rather than waiting for the primary model
+to cooperate. The Projector (from Hamutay) is the cognitive processor
+unit — it produces structured tensors with declared losses, epistemic
+state, and thematic strands. Without it, eviction relies on whatever
+the model volunteers inline via cooperative signals.
+
 Event flow:
   1. Receive inbound event (from client adapter)
   2. Advance turn: age R4 → R3
   3. Classify and place new content
   4. Pressure check → eviction decisions
-  5. Generate API payload from projection (via API adapter)
-  6. Receive outbound event (API response)
-  7. Ingest response into R3
-  8. Process cooperative memory signals
-  9. Execute queued removals
-  10. Pressure check again
+  5. If projector available: dispatch eviction candidates to sidecar
+  6. Generate API payload from projection (via API adapter)
+  7. Receive outbound event (API response)
+  8. Ingest response into R3
+  9. Process cooperative memory signals
+  10. Execute queued removals
+  11. Pressure check again
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import time
 from dataclasses import dataclass, field
@@ -101,7 +110,7 @@ class Orchestrator:
 
     The orchestrator is the only entity that mutates the projection.
     It coordinates between the pressure scheduler, region lifecycle,
-    and (eventually) the adapters.
+    the Projector sidecar (if available), and the adapters.
     """
 
     def __init__(
@@ -111,6 +120,8 @@ class Orchestrator:
         event_bus: EventBus | None = None,
         page_store: PageStore | None = None,
         checkpoint_store: CheckpointStore | None = None,
+        tensor_store: Any | None = None,
+        projector: Any | None = None,
     ) -> None:
         self.projection = projection or Projection()
         self.scheduler = PressureScheduler(context_limit=context_limit)
@@ -118,7 +129,19 @@ class Orchestrator:
         self.bus = event_bus or EventBus()
         self._page_store = page_store
         self._checkpoint_store = checkpoint_store
+        self._tensor_store = tensor_store
         self._idle = False
+
+        # Hamutay Projector sidecar — the cognitive processor unit.
+        # When present, eviction candidates are dispatched to the
+        # projector rather than waiting for inline model cooperation.
+        self._projector = projector
+        self._projection_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        self._pending_projections: dict[str, concurrent.futures.Future] = {}
+        if projector is not None:
+            self._projection_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="tinkuy-projector"
+            )
 
     def _emit(self, kind: EventKind, **data: Any) -> None:
         """Emit an event through the bus."""
@@ -135,11 +158,14 @@ class Orchestrator:
     def mark_idle(self) -> list[EvictionDecision]:
         """Mark the system as idle (cache boundary).
 
-        At idle, restructuring is free. Execute pending removals,
-        run pressure check with is_idle=True, then checkpoint.
+        At idle, restructuring is free. Drain any in-flight projections,
+        execute pending removals, run pressure check with is_idle=True,
+        then checkpoint.
         """
         self._idle = True
         self._emit(EventKind.IDLE_ENTERED)
+        # Drain projector sidecar — block until all in-flight complete
+        self._drain_projections_blocking()
         # Execute all pending removals that have tensors
         executed = self._execute_pending_removals()
         # Pressure check at idle
@@ -161,6 +187,9 @@ class Orchestrator:
 
         Returns a TurnRecord for observability.
         """
+        # Collect any completed projections from the sidecar
+        self._drain_projections()
+
         record = TurnRecord(turn=self.projection.turn)
         record.pressure_zone_before = self.scheduler.read_pressure(
             self.projection
@@ -222,19 +251,24 @@ class Orchestrator:
     ) -> TurnRecord:
         """Ingest an API response into the projection.
 
-        The response goes into R3 (ephemeral). Cooperative memory
-        signals are processed. Queued removals are executed.
+        The response goes into R4 (current) alongside the user content
+        that prompted it.  Both are from the same turn.  When the next
+        turn begins, R4 ages to R3 as a unit — preserving chronological
+        order (user before assistant).
+
+        Cooperative memory signals are processed.  Queued removals
+        are executed.
         """
         record = self.history[-1] if self.history else TurnRecord(
             turn=self.turn
         )
 
-        # Store assistant response in R3
+        # Store assistant response in R4 — same turn as the user content
         block = self.projection.add_content(
             content=content,
             kind=ContentKind.CONVERSATION,
             label=label,
-            region=RegionID.EPHEMERAL,
+            region=RegionID.CURRENT,
             content_blocks=content_blocks,
         )
         record.response_handle = block.handle
@@ -260,6 +294,152 @@ class Orchestrator:
         ).zone
 
         return record
+
+    # --- Projector sidecar ---
+
+    def _dispatch_to_projector(self, handle: str, content: str) -> None:
+        """Dispatch content to the Hamutay Projector sidecar.
+
+        Runs asynchronously in a thread pool. The resulting tensor is
+        ingested into R2 when the projection completes (either at the
+        next turn boundary or when explicitly drained).
+        """
+        if self._projector is None or self._projection_executor is None:
+            return
+
+        def _project() -> tuple[str, Any]:
+            """Run projection in background thread. Returns (handle, tensor)."""
+            tensor = self._projector.project(content)
+            return handle, tensor
+
+        future = self._projection_executor.submit(_project)
+        self._pending_projections[handle] = future
+        self._emit(
+            EventKind.BLOCK_CREATED,  # reuse; TODO: add PROJECTION_DISPATCHED
+            handle=handle,
+            content_kind="PROJECTION_DISPATCHED",
+            region="SIDECAR",
+            label=f"projector:{handle[:8]}",
+            size_tokens=len(content) // 4,
+        )
+        log.info("dispatched to projector: %s (%d chars)", handle[:8], len(content))
+
+    def _drain_projections(self) -> int:
+        """Collect completed projections and ingest tensors into R2.
+
+        Non-blocking: only collects futures that are already done.
+        Returns the number of tensors ingested.
+        """
+        if not self._pending_projections:
+            return 0
+
+        ingested = 0
+        completed: list[str] = []
+
+        for handle, future in self._pending_projections.items():
+            if not future.done():
+                continue
+            completed.append(handle)
+
+            try:
+                _, tensor = future.result()
+            except Exception as e:
+                log.error("projector failed for %s: %s", handle[:8], e)
+                self._emit(
+                    EventKind.EVICTION_DECIDED,
+                    handle=handle,
+                    action="PROJECTION_FAILED",
+                    reason=str(e),
+                )
+                continue
+
+            # Serialize the tensor
+            tensor_data = tensor.model_dump()
+            tensor_text = tensor.model_dump_json(indent=2)
+            declared_losses = "; ".join(
+                f"{loss.what_was_lost} ({loss.category.value})"
+                for loss in tensor.declared_losses
+            )
+
+            # Persist the verbatim original before evicting
+            for region in self.projection.regions.values():
+                block = region.find(handle)
+                if block and block.content:
+                    self._persist_page(handle, block.content)
+                    break
+
+            # Write tensor to the tensor store (immutable create)
+            if self._tensor_store is not None:
+                self._tensor_store.create(handle, tensor_data)
+
+            # Create the tensor block in R2. When a tensor store is
+            # configured, R2 holds a lightweight reference — the full
+            # tensor lives in the store. Without a store, R2 holds the
+            # serialized tensor directly (local convenience mode).
+            if self._tensor_store is not None:
+                # Reference mode: R2 block is a stub with metadata
+                tensor_block = ContentBlock.create(
+                    content=f"[tensor:{handle[:8]} — {len(tensor.strands)} strands, "
+                            f"{len(tensor.declared_losses)} losses]",
+                    kind=ContentKind.TENSOR,
+                    label=f"tensor:{handle[:8]}",
+                    region=RegionID.DURABLE,
+                    turn=self.turn,
+                )
+            else:
+                # Inline mode: R2 block holds the full serialized tensor
+                tensor_block = ContentBlock.create(
+                    content=tensor_text,
+                    kind=ContentKind.TENSOR,
+                    label=f"tensor:{handle[:8]}",
+                    region=RegionID.DURABLE,
+                    turn=self.turn,
+                )
+            tensor_block.metadata["declared_losses"] = declared_losses
+            tensor_block.metadata["tensor_cycle"] = tensor.cycle
+            tensor_block.metadata["n_strands"] = len(tensor.strands)
+            tensor_block.metadata["epistemic"] = {
+                "truth": tensor.epistemic.truth,
+                "indeterminacy": tensor.epistemic.indeterminacy,
+                "falsity": tensor.epistemic.falsity,
+            }
+            tensor_block.metadata["source_handle"] = handle
+
+            # Execute the eviction
+            self.projection.evict(handle, tensor_block)
+            self._emit(
+                EventKind.BLOCK_EVICTED,
+                handle=handle,
+                tensor_handle=tensor_block.handle,
+                declared_losses=declared_losses,
+                source="projector",
+            )
+            ingested += 1
+            log.info(
+                "projector tensor ingested: %s → %s (%d strands, %d losses, store=%s)",
+                handle[:8],
+                tensor_block.handle[:8],
+                len(tensor.strands),
+                len(tensor.declared_losses),
+                "yes" if self._tensor_store is not None else "inline",
+            )
+
+        for handle in completed:
+            del self._pending_projections[handle]
+
+        return ingested
+
+    def _drain_projections_blocking(self, timeout: float = 30.0) -> int:
+        """Block until all pending projections complete.
+
+        Used at idle boundaries and shutdown. Returns number ingested.
+        """
+        if not self._pending_projections:
+            return 0
+
+        futures = list(self._pending_projections.values())
+        concurrent.futures.wait(futures, timeout=timeout)
+        return self._drain_projections()
 
     # --- Internal machinery ---
 
@@ -289,8 +469,10 @@ class Orchestrator:
         cls,
         checkpoint_store: CheckpointStore,
         page_store: PageStore | None = None,
+        tensor_store: Any | None = None,
         context_limit: int = 200_000,
         event_bus: EventBus | None = None,
+        projector: Any | None = None,
     ) -> Orchestrator | None:
         """Restore an orchestrator from a checkpoint.
 
@@ -306,6 +488,8 @@ class Orchestrator:
             event_bus=event_bus,
             page_store=page_store,
             checkpoint_store=checkpoint_store,
+            tensor_store=tensor_store,
+            projector=projector,
         )
 
     def _emit_pressure_read(self) -> None:
@@ -590,6 +774,16 @@ class Orchestrator:
         Returns handles of blocks that were marked pending_removal.
         This is separate from begin_turn so the caller can inspect
         decisions before applying them.
+
+        When a Projector sidecar is available, REQUEST_TENSOR and
+        DEMAND_TENSOR decisions dispatch content to the projector
+        immediately. The projector produces a structured tensor
+        asynchronously; the result is ingested at the next turn
+        boundary or idle drain.
+
+        Without a projector, blocks are marked pending_removal and
+        the cooperative signal protocol remains the only path to
+        tensor production.
         """
         marked: list[str] = []
         for decision in decisions:
@@ -609,6 +803,11 @@ class Orchestrator:
                                 reason=decision.reason,
                             )
                             marked.append(decision.handle)
+                            # Dispatch to projector sidecar if available
+                            if self._projector is not None and block.content:
+                                self._dispatch_to_projector(
+                                    decision.handle, block.content
+                                )
                             break
 
                 case EvictionAction.EVICT:
