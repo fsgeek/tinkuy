@@ -106,6 +106,8 @@ def test_create_app_returns_fastapi_with_expected_routes_and_health():
     }
     assert "/v1/messages" in route_methods
     assert "POST" in route_methods["/v1/messages"]
+    assert "/v1beta/models/{model_id}:streamGenerateContent" in route_methods
+    assert "POST" in route_methods["/v1beta/models/{model_id}:streamGenerateContent"]
     assert "/v1/tinkuy/status" in route_methods
     assert "GET" in route_methods["/v1/tinkuy/status"]
     assert "/v1/tinkuy/health" in route_methods

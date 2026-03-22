@@ -233,6 +233,102 @@ def create_app(
                 media_type="application/json",
             )
 
+    @app.post("/v1beta/models/{model_id}:streamGenerateContent")
+    async def gemini_stream(model_id: str, request: Request) -> Response:
+        """The Gemini gateway path."""
+        from starlette.responses import StreamingResponse
+
+        body = await request.json()
+        session_id = request.headers.get("x-tinkuy-session")
+        gw = get_gateway(session_id)
+
+        # 1. Transform through Gateway
+        upstream_body = gw.prepare_gemini_request(body)
+        
+        # 2. Forward to actual Google API
+        headers = _forward_headers(request)
+        # Fix host header for Google if necessary
+        if "host" in headers:
+            del headers["host"]
+            
+        client: httpx.AsyncClient = request.app.state.client
+        
+        # Determine upstream URL for Gemini
+        gemini_upstream = os.environ.get("GOOGLE_VERTEX_BASE_URL") or os.environ.get("GOOGLE_GEMINI_BASE_URL") or "https://generativelanguage.googleapis.com"
+        target_url = f"{gemini_upstream.rstrip('/')}/v1beta/models/{model_id}:streamGenerateContent"
+        
+        # Forward query params (like API key)
+        if request.url.query:
+            target_url += f"?{request.url.query}"
+
+        upstream_bytes = json.dumps(upstream_body).encode("utf-8")
+        headers["content-type"] = "application/json"
+        
+        upstream_req = client.build_request(
+            "POST", target_url,
+            content=upstream_bytes, headers=headers,
+        )
+        
+        t_start = time.monotonic()
+        upstream_resp = await client.send(upstream_req, stream=True)
+
+        if upstream_resp.status_code >= 400:
+            return await _handle_error(
+                upstream_resp, upstream_body, upstream_bytes
+            )
+
+        # Gemini streams a JSON array of response objects, usually chunked.
+        # We will pass the chunks directly to the client, but accumulate
+        # the JSON strings to re-parse the full response at the end.
+        
+        accumulated_chunks = []
+        
+        async def stream_and_collect():
+            async for chunk in upstream_resp.aiter_bytes():
+                accumulated_chunks.append(chunk)
+                yield chunk
+            await upstream_resp.aclose()
+            
+            # Reconstruct the full JSON array once the stream is done
+            full_bytes = b"".join(accumulated_chunks)
+            try:
+                # Gemini streaming returns a JSON array of responses: [ {...}, {...} ]
+                responses = json.loads(full_bytes)
+                if responses and isinstance(responses, list):
+                    # We can synthesize a single combined GenerateContentResponse
+                    # by merging the text from the candidates.
+                    combined_text = ""
+                    for r in responses:
+                        candidates = r.get("candidates", [])
+                        if candidates:
+                            parts = candidates[0].get("content", {}).get("parts", [])
+                            for p in parts:
+                                if "text" in p:
+                                    combined_text += p["text"]
+                    
+                    # Create a synthetic final response to ingest
+                    synthetic_response = {
+                        "candidates": [
+                            {
+                                "content": {
+                                    "parts": [{"text": combined_text}]
+                                }
+                            }
+                        ]
+                    }
+                    # Ingest synchronously
+                    gw.ingest_gemini_response(synthetic_response)
+            except json.JSONDecodeError as e:
+                log.error("Failed to decode accumulated Gemini stream: %s", e)
+
+        resp_headers = _strip_encoding_headers(upstream_resp)
+        return StreamingResponse(
+            stream_and_collect(),
+            status_code=upstream_resp.status_code,
+            headers=resp_headers,
+            media_type="application/json",
+        )
+
     @app.get("/v1/tinkuy/status")
     async def status(request: Request) -> dict[str, Any]:
         """Gateway status endpoint."""
