@@ -183,19 +183,12 @@ class LiveAdapter:
         if block.kind == ContentKind.SYSTEM:
             return None  # System content handled separately
 
-        # Determine role
+        # Determine role and content based on block kind
         if block.kind == ContentKind.TENSOR:
-            # Tensors are summaries — present as assistant content
-            return {
-                "role": "assistant",
-                "content": block.content,
-                "_region": region.name,
-                "_handle": block.handle,
-            }
-
-        if block.kind == ContentKind.TOOL_RESULT:
-            # Tool results must be structured for the Anthropic API.
-            # The tool_use_id is preserved in block metadata.
+            role = "assistant"
+            content: str | list[dict[str, Any]] = block.content
+        elif block.kind == ContentKind.TOOL_RESULT:
+            role = "user"
             tool_use_id = block.metadata.get("tool_use_id", block.label)
             result_content = block.content
             if block.status == ContentStatus.AVAILABLE:
@@ -209,37 +202,29 @@ class LiveAdapter:
             }
             if block.metadata.get("is_error"):
                 tool_result_block["is_error"] = True
-            return {
-                "role": "user",
-                "content": [tool_result_block],
-                "_region": region.name,
-                "_handle": block.handle,
-            }
-
-        if block.kind == ContentKind.CONVERSATION:
-            # Infer role from label or default based on position
+            content = [tool_result_block]
+        elif block.kind == ContentKind.CONVERSATION:
             role = "assistant" if "assistant" in block.label else "user"
-        elif block.kind == ContentKind.FILE:
-            role = "user"  # File content is user-side
+            if block.status == ContentStatus.AVAILABLE:
+                content = (
+                    f"[tensor:{block.handle[:8]} — "
+                    f"{block.label} "
+                    f"({block.size_tokens} tokens)]"
+                )
+            else:
+                stored_blocks = block.metadata.get("content_blocks")
+                content = stored_blocks if stored_blocks else block.content
         else:
             role = "user"
-
-        # Handle evicted content
-        if block.status == ContentStatus.AVAILABLE:
-            # Content was evicted — emit tensor marker
-            content: str | list[dict[str, Any]] = (
-                f"[tensor:{block.handle[:8]} — "
-                f"{block.label} "
-                f"({block.size_tokens} tokens)]"
-            )
-        else:
-            # Use full content blocks (text + tool_use) if available,
-            # otherwise fall back to plain text string
-            stored_blocks = block.metadata.get("content_blocks")
-            if stored_blocks:
-                content = stored_blocks
+            if block.status == ContentStatus.AVAILABLE:
+                content = (
+                    f"[tensor:{block.handle[:8]} — "
+                    f"{block.label} "
+                    f"({block.size_tokens} tokens)]"
+                )
             else:
-                content = block.content
+                stored_blocks = block.metadata.get("content_blocks")
+                content = stored_blocks if stored_blocks else block.content
 
         msg: dict[str, Any] = {
             "role": role,
@@ -248,9 +233,12 @@ class LiveAdapter:
             "_handle": block.handle,
         }
 
-        # Cache control hints based on region
-        if region == RegionID.DURABLE:
+        # Cache control hints based on region.
+        # R2 (durable) and R3 (ephemeral) both get hints — content in
+        # both regions is stable between turns. Only R4 (current) changes.
+        if region in (RegionID.DURABLE, RegionID.EPHEMERAL):
             msg["_cache_control"] = {"type": "ephemeral"}
+            msg["_cache_tier"] = region.name
 
         return msg
 
@@ -294,9 +282,13 @@ class LiveAdapter:
                     # Fallback — should not happen
                     prev["content"] = str(prev_content) + "\n" + str(new_content)
 
-                # Preserve cache hint: if either message is durable, keep it
-                if "_cache_control" in msg and "_cache_control" not in prev:
+                # Preserve cache hints through merge. When merging messages
+                # from different tiers, the later message's tier wins (it
+                # determines the boundary position in _finalize_messages).
+                if "_cache_control" in msg:
                     prev["_cache_control"] = msg["_cache_control"]
+                if "_cache_tier" in msg:
+                    prev["_cache_tier"] = msg["_cache_tier"]
             else:
                 # Need alternation — insert padding if needed
                 if result and role == "assistant" and result[-1]["role"] == "assistant":
@@ -319,21 +311,37 @@ class LiveAdapter:
     def _finalize_messages(
         self, messages: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        """Place cache breakpoint on last durable message, strip annotations.
+        """Place cache breakpoints at region boundaries, strip annotations.
 
         Anthropic caches from the start of the request up to each
-        cache_control breakpoint. We place one on the last message
-        that carries _cache_control — the boundary between stable
-        (durable) and volatile (ephemeral/current) conversation.
+        cache_control breakpoint (max 4). We use up to 2 in messages:
+
+        1. Last R2 (durable) message — the stable curated content
+        2. Last R3 (ephemeral) message — stable between turns, only
+           changes when eviction runs
+
+        R4 (current turn) is never cached — it changes every turn.
+        This gives us: system(1) + R2(1) + R3(1) = 3 of 4 budget.
 
         cache_control goes on a content block, not the message dict,
         so we convert the message's string content to a content array.
         """
-        # Find the last message with a cache hint
-        last_cached_idx = None
+        # Find the last message in each cache tier
+        last_durable_idx = None
+        last_ephemeral_idx = None
         for i, msg in enumerate(messages):
-            if "_cache_control" in msg:
-                last_cached_idx = i
+            tier = msg.get("_cache_tier")
+            if tier == "DURABLE":
+                last_durable_idx = i
+            elif tier == "EPHEMERAL":
+                last_ephemeral_idx = i
+
+        # Collect the indices that get breakpoints
+        breakpoint_indices = set()
+        if last_durable_idx is not None:
+            breakpoint_indices.add(last_durable_idx)
+        if last_ephemeral_idx is not None:
+            breakpoint_indices.add(last_ephemeral_idx)
 
         result: list[dict[str, Any]] = []
         for i, msg in enumerate(messages):
@@ -345,7 +353,7 @@ class LiveAdapter:
                     _sanitize_content_block(b) for b in clean["content"]
                 ]
 
-            if i == last_cached_idx:
+            if i in breakpoint_indices:
                 # Promote to content array with cache_control on last block
                 content = clean["content"]
                 if isinstance(content, str):

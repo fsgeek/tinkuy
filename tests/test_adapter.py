@@ -342,7 +342,13 @@ def test_live_synthesize_messages_starts_with_user_when_first_message_is_assista
 
     # [conversation start] padding gets the page table injected
     assert payload["messages"][0]["role"] == "user"
-    assert payload["messages"][1] == {"role": "assistant", "content": "assistant first"}
+    # Ephemeral assistant message gets cache breakpoint (last R3 content)
+    assert payload["messages"][1]["role"] == "assistant"
+    content = payload["messages"][1]["content"]
+    if isinstance(content, list):
+        assert any(b.get("text") == "assistant first" for b in content)
+    else:
+        assert content == "assistant first"
 
 
 def test_live_synthesize_page_table_output_format():
