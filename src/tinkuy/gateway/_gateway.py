@@ -456,12 +456,6 @@ class Gateway:
             len(tool_results) if tool_results else 0,
         )
 
-        # Feed max_tokens into pressure scheduler so it reserves
-        # output budget when computing effective context limit
-        max_tokens = client_body.get("max_tokens", 0)
-        if isinstance(max_tokens, int) and max_tokens > 0:
-            self.orchestrator.scheduler.output_budget = max_tokens
-
         # Snapshot client request metadata before processing
         self._pending_turn_context = _capture_client_context(
             client_body, request_messages,

@@ -88,7 +88,9 @@ class PressureScheduler:
     def __init__(self, context_limit: int = 200_000) -> None:
         self.context_limit = context_limit
         self.overhead_tokens: int = 0  # passthrough cost (tools, system, etc.)
-        self.output_budget: int = 0    # max_tokens from client request
+        # Note: max_tokens is an output cap, not an input reservation.
+        # The API does not reject requests where input + max_tokens
+        # exceeds the context limit — it just truncates generation.
         # Weights for candidate scoring
         self._kind_weights: dict[ContentKind, float] = {
             ContentKind.TOOL_RESULT: 1.5,    # most evictable
@@ -106,7 +108,7 @@ class PressureScheduler:
         reflects the actual budget available for projection content.
         """
         effective_limit = max(
-            0, self.context_limit - self.overhead_tokens - self.output_budget
+            0, self.context_limit - self.overhead_tokens
         )
         return PressureState(
             total_tokens=projection.total_tokens,
