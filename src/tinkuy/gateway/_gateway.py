@@ -297,8 +297,11 @@ class Gateway:
             restored.projection.total_tokens,
         )
         gw.orchestrator = restored
+        # Rebuild all adapters — they hold a reference to the orchestrator
         gw._ingest = IngestAdapter(gw.orchestrator)
-        # Note: adapters use self.orchestrator which is now 'restored'
+        gw._anthropic_live = AnthropicLiveAdapter(gw.orchestrator)
+        gw._gemini_live = GeminiLiveAdapter(gw.orchestrator)
+        gw._gemini_response = GeminiResponseIngester(gw.orchestrator)
         return gw
 
     def rehydrate(self, source: str | Path | dict[str, Any]) -> None:
