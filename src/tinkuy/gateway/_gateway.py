@@ -573,6 +573,12 @@ class Gateway:
                     0.3 * self._client_overhead_tokens + 0.7 * overhead
                 )
 
+            # Feed overhead into pressure scheduler so it knows the
+            # real budget available for projection content
+            self.orchestrator.scheduler.overhead_tokens = (
+                self._client_overhead_tokens
+            )
+
         log.info(
             "  telemetry | %s in=%d+%dcache out=%d overhead=%s",
             telemetry.message_id[:12] if telemetry.message_id else "?",

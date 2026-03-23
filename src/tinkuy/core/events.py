@@ -183,6 +183,9 @@ class ConsoleStatusConsumer(EventConsumer):
     def on_event(self, event: Event) -> None:
         if event.kind == EventKind.PRESSURE_READ:
             self._total_tokens = event.data.get("total_tokens", 0)
+            self._effective_limit = event.data.get(
+                "context_limit", self.context_limit
+            )
             zone = event.data.get("zone", "unknown")
             if zone != self._last_zone:
                 self._last_zone = zone
@@ -215,16 +218,17 @@ class ConsoleStatusConsumer(EventConsumer):
 
     def _render_status(self) -> None:
         """Render the turn-start status line with gap timing."""
+        effective = getattr(self, "_effective_limit", self.context_limit)
         usage_pct = (
-            (self._total_tokens / self.context_limit * 100)
-            if self.context_limit > 0 else 100
+            (self._total_tokens / effective * 100)
+            if effective > 0 else 100
         )
         gap = ""
         if self._last_turn_end is not None:
             gap_s = self._turn_start - self._last_turn_end
             gap = f" | gap:{self._fmt_duration(gap_s)}"
         line = (
-            f"Context: {self._total_tokens:,}/{self.context_limit:,} tok "
+            f"Context: {self._total_tokens:,}/{effective:,} tok "
             f"({usage_pct:.0f}%) | "
             f"Pressure: {self._last_zone or 'unknown'} | "
             f"Turn: {self._turn}{gap}"

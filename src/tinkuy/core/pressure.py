@@ -87,6 +87,7 @@ class PressureScheduler:
 
     def __init__(self, context_limit: int = 200_000) -> None:
         self.context_limit = context_limit
+        self.overhead_tokens: int = 0  # passthrough cost (tools, system, etc.)
         # Weights for candidate scoring
         self._kind_weights: dict[ContentKind, float] = {
             ContentKind.TOOL_RESULT: 1.5,    # most evictable
@@ -97,10 +98,18 @@ class PressureScheduler:
         }
 
     def read_pressure(self, projection: Projection) -> PressureState:
-        """Read current pressure from the projection."""
+        """Read current pressure from the projection.
+
+        The effective context limit is reduced by the passthrough
+        overhead (tools, system prompt, etc.) so that pressure
+        reflects the actual budget available for projection content.
+        """
+        effective_limit = max(
+            0, self.context_limit - self.overhead_tokens
+        )
         return PressureState(
             total_tokens=projection.total_tokens,
-            context_limit=self.context_limit,
+            context_limit=effective_limit,
             waste_tokens=projection.waste_tokens,
         )
 
