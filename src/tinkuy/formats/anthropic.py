@@ -61,6 +61,7 @@ class LiveAdapter:
     def __init__(self, orchestrator: Orchestrator) -> None:
         self.orchestrator = orchestrator
         self.last_repair_counts: dict[str, int] = {}
+        self.last_page_table_tokens: int = 0
 
     def synthesize_messages(self) -> dict[str, Any]:
         """Synthesize a complete Anthropic API messages payload.
@@ -87,6 +88,9 @@ class LiveAdapter:
         page_table = self.synthesize_page_table()
         if page_table:
             self._inject_page_table(messages, page_table)
+            # Track page table size for telemetry — this is the gateway's
+            # own contribution to the wire, invisible to region accounting.
+            self.last_page_table_tokens = len(page_table) // 4  # rough estimate
 
         payload["messages"] = messages
         return payload

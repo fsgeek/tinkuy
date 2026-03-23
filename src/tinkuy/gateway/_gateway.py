@@ -471,9 +471,12 @@ class Gateway:
         self._pending_turn_context["projection"] = (
             self._snapshot_gateway_state()
         )
-        # Capture repair counts from the synthesizer
+        # Capture repair counts and page table cost from the synthesizer
         self._pending_turn_context["repairs"] = (
             self._anthropic_live.last_repair_counts
+        )
+        self._pending_turn_context["projection"]["page_table_tokens"] = (
+            self._anthropic_live.last_page_table_tokens
         )
 
         # Build complete upstream body
@@ -561,23 +564,16 @@ class Gateway:
         api_total = telemetry.total_input_tokens
         projection_tokens = self.orchestrator.projection.total_tokens
         if api_total > 0:
-            if api_total > projection_tokens:
-                overhead = api_total - projection_tokens
-            else:
-                overhead = 0
+            overhead = max(0, api_total - projection_tokens)
 
-            if self._client_overhead_tokens is None:
-                self._client_overhead_tokens = overhead
-            else:
-                self._client_overhead_tokens = int(
-                    0.3 * self._client_overhead_tokens + 0.7 * overhead
-                )
+            # Use actual overhead each turn — no smoothing. The overhead
+            # has a stable component (client tools/system) and a growing
+            # component (page table). Smoothing hides the growth.
+            self._client_overhead_tokens = overhead
 
             # Feed overhead into pressure scheduler so it knows the
             # real budget available for projection content
-            self.orchestrator.scheduler.overhead_tokens = (
-                self._client_overhead_tokens
-            )
+            self.orchestrator.scheduler.overhead_tokens = overhead
 
         log.info(
             "  telemetry | %s in=%d+%dcache out=%d overhead=%s",
