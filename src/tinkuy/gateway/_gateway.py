@@ -538,6 +538,18 @@ class Gateway:
             return None
         from tinkuy.gateway.harness import extract_signals, strip_signals
         signals = extract_signals(text) if text else []
+        if signals:
+            log.info(
+                "parsed %d cooperative signal(s): %s",
+                len(signals),
+                [(s["type"], s.get("handle", "")[:12]) for s in signals],
+            )
+        elif text and "yuyay" in text.lower():
+            log.warning(
+                "response contains 'yuyay' but no signals parsed "
+                "(text len=%d, first 200: %s)",
+                len(text), text[:200],
+            )
         clean = strip_signals(text) if text else ""
         return self.ingest_response(
             content=clean,
