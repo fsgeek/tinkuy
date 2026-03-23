@@ -786,25 +786,58 @@ class Orchestrator:
         )
 
     def _execute_pending_removals(self) -> int:
-        """Execute all pending removals that have tensor replacements.
+        """Execute all pending removals.
+
+        Blocks with tensor replacements are evicted normally.
+        Blocks stuck pending without tensors for more than 3 turns
+        are force-evicted — content is persisted to the page store
+        and the block becomes faultable with a stub marker. Better
+        to lose the tensor summary than deadlock the eviction pipeline.
 
         Returns the number of evictions executed.
         """
         count = 0
+        pressure = self.scheduler.read_pressure(self.projection)
         for region in self.projection.regions.values():
             for block in list(region.blocks):
-                if (
-                    block.status == ContentStatus.PENDING_REMOVAL
-                    and block.tensor_handle is not None
-                ):
-                    # The tensor should already be in R2 (placed by evict)
-                    # Just update the block status
+                if block.status != ContentStatus.PENDING_REMOVAL:
+                    continue
+
+                if block.tensor_handle is not None:
+                    # Normal path — tensor available
                     block.status = ContentStatus.AVAILABLE
-                    block.content = ""  # Free the content, page store has it
+                    block.content = ""
                     self._emit(
                         EventKind.EVICTION_EXECUTED,
                         handle=block.handle,
                         tensor_handle=block.tensor_handle,
+                    )
+                    count += 1
+                elif (
+                    self.turn - block.access.last_access_turn >= 3
+                    and pressure.zone in (
+                        PressureZone.ELEVATED, PressureZone.CRITICAL,
+                    )
+                ):
+                    # Force-evict: stuck pending with no tensor and
+                    # pressure is high. Persist content, evict with stub.
+                    if block.content:
+                        self._persist_page(block.handle, block.content)
+                    log.warning(
+                        "force-evicting %s (%d tok) — pending %d turns, "
+                        "no tensor, pressure=%s",
+                        block.handle[:8],
+                        block.size_tokens,
+                        self.turn - block.access.last_access_turn,
+                        pressure.zone.name,
+                    )
+                    block.status = ContentStatus.AVAILABLE
+                    block.content = ""
+                    self._emit(
+                        EventKind.EVICTION_EXECUTED,
+                        handle=block.handle,
+                        tensor_handle=None,
+                        force=True,
                     )
                     count += 1
         return count
