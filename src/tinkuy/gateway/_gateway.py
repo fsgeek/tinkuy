@@ -550,6 +550,19 @@ class Gateway:
                 "(text len=%d, first 200: %s)",
                 len(text), text[:200],
             )
+
+        # Stash signal data for telemetry persistence
+        if self._pending_turn_context is not None:
+            self._pending_turn_context["signals"] = {
+                "parsed_count": len(signals),
+                "signals": [
+                    {"type": s["type"], "handle": s.get("handle", "")}
+                    for s in signals
+                ],
+                "response_text_len": len(text) if text else 0,
+                "contains_yuyay": bool(text and "yuyay" in text.lower()),
+            }
+
         clean = strip_signals(text) if text else ""
         return self.ingest_response(
             content=clean,

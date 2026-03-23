@@ -700,11 +700,26 @@ def serve(
         )
 
     log_level = os.environ.get("TINKUY_LOG_LEVEL", "INFO").upper()
-    logging.basicConfig(
-        format="[tinkuy] %(message)s",
-        level=getattr(logging, log_level, logging.INFO),
-        stream=sys.stderr,
-    )
+
+    # Log to both stderr (console) and a persistent file.
+    # Console is ephemeral — the file is the research record.
+    root_logger = logging.getLogger()
+    root_logger.setLevel(getattr(logging, log_level, logging.INFO))
+
+    console_handler = logging.StreamHandler(sys.stderr)
+    console_handler.setFormatter(logging.Formatter("[tinkuy] %(message)s"))
+    root_logger.addHandler(console_handler)
+
+    if data_dir:
+        log_path = Path(data_dir) / "gateway.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_path)
+        file_handler.setFormatter(logging.Formatter(
+            "%(asctime)s [%(name)s] %(message)s"
+        ))
+        root_logger.addHandler(file_handler)
+        print(f"\n  logging to {log_path}\n", file=sys.stderr)
+
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
