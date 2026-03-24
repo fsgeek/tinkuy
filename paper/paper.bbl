@@ -1,0 +1,186 @@
+%%% -*-BibTeX-*-
+%%% Do NOT edit. File created by BibTeX with style
+%%% ACM-Reference-Format-Journals [18-Jan-2012].
+
+\begin{thebibliography}{12}
+
+%%% ====================================================================
+%%% NOTE TO THE USER: you can override these defaults by providing
+%%% customized versions of any of these macros before the \bibliography
+%%% command.  Each of them MUST provide its own final punctuation,
+%%% except for \shownote{} and \showURL{}.  The latter two
+%%% do not use final punctuation, in order to avoid confusing it with
+%%% the Web address.
+%%%
+%%% To suppress output of a particular field, define its macro to expand
+%%% to an empty string, or better, \unskip, like this:
+%%%
+%%% \newcommand{\showURL}[1]{\unskip}   % LaTeX syntax
+%%%
+%%% \def \showURL #1{\unskip}           % plain TeX syntax
+%%%
+%%% ====================================================================
+
+\ifx \showCODEN    \undefined \def \showCODEN     #1{\unskip}     \fi
+\ifx \showISBNx    \undefined \def \showISBNx     #1{\unskip}     \fi
+\ifx \showISBNxiii \undefined \def \showISBNxiii  #1{\unskip}     \fi
+\ifx \showISSN     \undefined \def \showISSN      #1{\unskip}     \fi
+\ifx \showLCCN     \undefined \def \showLCCN      #1{\unskip}     \fi
+\ifx \shownote     \undefined \def \shownote      #1{#1}          \fi
+\ifx \showarticletitle \undefined \def \showarticletitle #1{#1}   \fi
+\ifx \showURL      \undefined \def \showURL       {\relax}        \fi
+% The following commands are used for tagged output and should be
+% invisible to TeX
+\providecommand\bibfield[2]{#2}
+\providecommand\bibinfo[2]{#2}
+\providecommand\natexlab[1]{#1}
+\providecommand\showeprint[2][]{arXiv:#2}
+
+\bibitem[Anthropic(2024)]%
+        {anthropic2024claude}
+\bibfield{author}{\bibinfo{person}{Anthropic}.}
+  \bibinfo{year}{2024}\natexlab{}.
+\newblock \bibinfo{title}{The Claude Model Family}.
+\newblock \bibinfo{howpublished}{\url{https://www.anthropic.com/claude}}.
+\newblock
+\newblock
+\shownote{200K token context window}.
+
+
+\bibitem[Belady(1966)]%
+        {belady1966anomaly}
+\bibfield{author}{\bibinfo{person}{L.~A. Belady}.}
+  \bibinfo{year}{1966}\natexlab{}.
+\newblock \showarticletitle{A Study of Replacement Algorithms for a
+  Virtual-Storage Computer}.
+\newblock \bibinfo{journal}{\emph{IBM Systems Journal}} \bibinfo{volume}{5},
+  \bibinfo{number}{2} (\bibinfo{year}{1966}), \bibinfo{pages}{78--101}.
+\newblock
+\href{https://doi.org/10.1147/sj.52.0078}{doi:\nolinkurl{10.1147/sj.52.0078}}
+
+
+\bibitem[Beltagy et~al\mbox{.}(2020)]%
+        {beltagy2020longformer}
+\bibfield{author}{\bibinfo{person}{Iz Beltagy}, \bibinfo{person}{Matthew~E.
+  Peters}, {and} \bibinfo{person}{Arman Cohan}.}
+  \bibinfo{year}{2020}\natexlab{}.
+\newblock \showarticletitle{Longformer: The Long-Document Transformer}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2004.05150}}
+  (\bibinfo{year}{2020}).
+\newblock
+
+
+\bibitem[Chevalier et~al\mbox{.}(2023)]%
+        {chevalier2023autocompressors}
+\bibfield{author}{\bibinfo{person}{Alexis Chevalier},
+  \bibinfo{person}{Alexander Wettig}, \bibinfo{person}{Anirudh Kalyan}, {and}
+  \bibinfo{person}{Danqi Chen}.} \bibinfo{year}{2023}\natexlab{}.
+\newblock \showarticletitle{Adapting Language Models to Compress Contexts}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2305.14788}}
+  (\bibinfo{year}{2023}).
+\newblock
+
+
+\bibitem[Child et~al\mbox{.}(2019)]%
+        {child2019generating}
+\bibfield{author}{\bibinfo{person}{Rewon Child}, \bibinfo{person}{Scott Gray},
+  \bibinfo{person}{Alec Radford}, {and} \bibinfo{person}{Ilya Sutskever}.}
+  \bibinfo{year}{2019}\natexlab{}.
+\newblock \showarticletitle{Generating Long Sequences with Sparse
+  Transformers}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:1904.10509}}
+  (\bibinfo{year}{2019}).
+\newblock
+
+
+\bibitem[DeepMind(2024)]%
+        {google2024gemini}
+\bibfield{author}{\bibinfo{person}{Google DeepMind}.}
+  \bibinfo{year}{2024}\natexlab{}.
+\newblock \bibinfo{title}{Gemini: A Family of Highly Capable Multimodal
+  Models}.
+\newblock
+  \bibinfo{howpublished}{\url{https://deepmind.google/technologies/gemini/}}.
+\newblock
+\newblock
+\shownote{Up to 2M token context window}.
+
+
+\bibitem[Denning(1968)]%
+        {denning1968working}
+\bibfield{author}{\bibinfo{person}{Peter~J. Denning}.}
+  \bibinfo{year}{1968}\natexlab{}.
+\newblock \showarticletitle{The Working Set Model for Program Behavior}.
+\newblock \bibinfo{journal}{\emph{Commun. ACM}} \bibinfo{volume}{11},
+  \bibinfo{number}{5} (\bibinfo{year}{1968}), \bibinfo{pages}{323--333}.
+\newblock
+\href{https://doi.org/10.1145/363095.363141}{doi:\nolinkurl{10.1145/363095.363141}}
+
+
+\bibitem[Jiang et~al\mbox{.}(2023)]%
+        {jiang2023llmlingua}
+\bibfield{author}{\bibinfo{person}{Huiqiang Jiang}, \bibinfo{person}{Qianhui
+  Wu}, \bibinfo{person}{Chin-Yew Lin}, \bibinfo{person}{Yuqing Yang}, {and}
+  \bibinfo{person}{Lili Qiu}.} \bibinfo{year}{2023}\natexlab{}.
+\newblock \showarticletitle{{LLMLingua}: Compressing Prompts for Accelerated
+  Inference of Large Language Models}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2310.05736}}
+  (\bibinfo{year}{2023}).
+\newblock
+
+
+\bibitem[Kilburn et~al\mbox{.}(1962)]%
+        {kilburn1962atlas}
+\bibfield{author}{\bibinfo{person}{T. Kilburn}, \bibinfo{person}{D.~B.~G.
+  Edwards}, \bibinfo{person}{M.~J. Lanigan}, {and} \bibinfo{person}{F.~H.
+  Sumner}.} \bibinfo{year}{1962}\natexlab{}.
+\newblock \showarticletitle{One-Level Storage System}. In
+  \bibinfo{booktitle}{\emph{IRE Transactions on Electronic Computers}},
+  Vol.~\bibinfo{volume}{EC-11}. \bibinfo{pages}{223--235}.
+\newblock
+\href{https://doi.org/10.1109/TEC.1962.5219356}{doi:\nolinkurl{10.1109/TEC.1962.5219356}}
+
+
+\bibitem[Lewis et~al\mbox{.}(2020)]%
+        {lewis2020rag}
+\bibfield{author}{\bibinfo{person}{Patrick Lewis}, \bibinfo{person}{Ethan
+  Perez}, \bibinfo{person}{Aleksandra Piktus}, \bibinfo{person}{Fabio Petroni},
+  \bibinfo{person}{Vladimir Karpukhin}, \bibinfo{person}{Naman Goyal},
+  \bibinfo{person}{Heinrich K{\"u}ttler}, \bibinfo{person}{Mike Lewis},
+  \bibinfo{person}{Wen-tau Yih}, \bibinfo{person}{Tim Rockt{\"a}schel},
+  \bibinfo{person}{Sebastian Riedel}, {and} \bibinfo{person}{Douwe Kiela}.}
+  \bibinfo{year}{2020}\natexlab{}.
+\newblock \showarticletitle{Retrieval-Augmented Generation for
+  Knowledge-Intensive {NLP} Tasks}. In \bibinfo{booktitle}{\emph{Advances in
+  Neural Information Processing Systems}}, Vol.~\bibinfo{volume}{33}.
+  \bibinfo{pages}{9459--9474}.
+\newblock
+
+
+\bibitem[Packer et~al\mbox{.}(2023)]%
+        {packer2023memgpt}
+\bibfield{author}{\bibinfo{person}{Charles Packer}, \bibinfo{person}{Sarah
+  Wooders}, \bibinfo{person}{Kevin Lin}, \bibinfo{person}{Vivian Fang},
+  \bibinfo{person}{Shishir~G. Patil}, \bibinfo{person}{Ion Stoica}, {and}
+  \bibinfo{person}{Joseph~E. Gonzalez}.} \bibinfo{year}{2023}\natexlab{}.
+\newblock \showarticletitle{{MemGPT}: Towards {LLMs} as Operating Systems}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2310.08560}}
+  (\bibinfo{year}{2023}).
+\newblock
+
+
+\bibitem[Zaheer et~al\mbox{.}(2020)]%
+        {zaheer2020bigbird}
+\bibfield{author}{\bibinfo{person}{Manzil Zaheer}, \bibinfo{person}{Guru
+  Guruganesh}, \bibinfo{person}{Kumar~Avinava Dubey}, \bibinfo{person}{Joshua
+  Ainslie}, \bibinfo{person}{Chris Alberti}, \bibinfo{person}{Santiago
+  Ontanon}, \bibinfo{person}{Philip Pham}, \bibinfo{person}{Anirudh Ravula},
+  \bibinfo{person}{Qifan Wang}, \bibinfo{person}{Li Yang}, {and}
+  \bibinfo{person}{Amr Ahmed}.} \bibinfo{year}{2020}\natexlab{}.
+\newblock \showarticletitle{Big Bird: Transformers for Longer Sequences}.
+\newblock   \bibinfo{volume}{33} (\bibinfo{year}{2020}),
+  \bibinfo{pages}{17283--17297}.
+\newblock
+
+
+\end{thebibliography}

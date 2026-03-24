@@ -132,6 +132,11 @@ class Orchestrator:
         self._tensor_store = tensor_store
         self._idle = False
 
+        # Signal feedback: outcomes of cooperative signals from the last turn.
+        # Cleared at the start of each turn, populated during signal processing.
+        # The page table synthesizer reads this to tell the model what happened.
+        self.signal_outcomes: list[dict[str, Any]] = []
+
         # Hamutay Projector sidecar — the cognitive processor unit.
         # When present, eviction candidates are dispatched to the
         # projector rather than waiting for inline model cooperation.
@@ -187,6 +192,9 @@ class Orchestrator:
 
         Returns a TurnRecord for observability.
         """
+        # Clear signal outcomes from prior turn
+        self.signal_outcomes = []
+
         # Collect any completed projections from the sidecar
         self._drain_projections()
 
@@ -626,6 +634,18 @@ class Orchestrator:
         )
         if signal.declared_losses:
             tensor.metadata["declared_losses"] = signal.declared_losses
+        tensor.metadata["source"] = "cooperative"
+
+        # Persist to tensor store — same contract as the projector path.
+        # Cooperative tensors are plain text (not structured Tensor objects),
+        # so we wrap them in a minimal dict that the store can serialize.
+        if self._tensor_store is not None:
+            self._tensor_store.create(signal.handle, {
+                "content": signal.tensor_content,
+                "declared_losses": signal.declared_losses,
+                "source": "cooperative",
+                "turn": self.turn,
+            })
 
         # Execute the eviction
         self.projection.evict(signal.handle, tensor)
@@ -640,6 +660,13 @@ class Orchestrator:
             handle=signal.handle,
             tensor_handle=tensor.handle,
         )
+        self.signal_outcomes.append({
+            "signal": "release",
+            "handle": signal.handle,
+            "outcome": "accepted",
+            "tensor_persisted": self._tensor_store is not None,
+            "tensor_handle": tensor.handle,
+        })
 
     def _handle_retain(self, signal: ResponseSignal) -> None:
         """Model wants to cancel a pending removal."""
@@ -656,13 +683,31 @@ class Orchestrator:
                     EventKind.SIGNAL_RETAIN,
                     handle=signal.handle,
                 )
+                self.signal_outcomes.append({
+                    "signal": "retain",
+                    "handle": signal.handle,
+                    "outcome": "accepted",
+                })
                 return
+        # Block wasn't pending — retain was a no-op
+        self.signal_outcomes.append({
+            "signal": "retain",
+            "handle": signal.handle,
+            "outcome": "no_effect",
+            "reason": "block not pending removal",
+        })
 
     def _handle_recall(self, signal: ResponseSignal) -> None:
         """Model wants to recall evicted content.
 
-        Falls back to the persistent page store if the projection's
-        in-memory store doesn't have the content.
+        Fallback chain:
+          1. Projection in-memory page store (fastest)
+          2. Persistent page store (verbatim original)
+          3. Tensor store (compressed summary — degraded but present)
+
+        A tensor recall is better than silence. The model gets its own
+        compressed notes back, which is enough to reconstruct context
+        even if the verbatim original is gone.
         """
         result = self.projection.recall(signal.handle)
         if result is None and self._page_store is not None:
@@ -672,7 +717,20 @@ class Orchestrator:
                 # Inject into the projection's page store, then recall
                 self.projection.page_store[signal.handle] = content
                 result = self.projection.recall(signal.handle)
+        if result is None and self._tensor_store is not None:
+            # Degraded recall: use the tensor (compressed summary)
+            tensor_data = self._tensor_store.get(signal.handle)
+            if tensor_data is not None:
+                tensor_content = tensor_data.get("content", "")
+                if tensor_content:
+                    self.projection.page_store[signal.handle] = tensor_content
+                    result = self.projection.recall(signal.handle)
+                    log.info(
+                        "degraded recall: %s restored from tensor (original lost)",
+                        signal.handle[:8],
+                    )
         if result is not None:
+            # Determine recall source for feedback
             # Find the block to get fault count
             for region in self.projection.regions.values():
                 block = region.find(signal.handle)
@@ -689,6 +747,18 @@ class Orchestrator:
                         evicted_at=block.access.evicted_at,
                     )
                     break
+            self.signal_outcomes.append({
+                "signal": "recall",
+                "handle": signal.handle,
+                "outcome": "restored",
+            })
+        else:
+            self.signal_outcomes.append({
+                "signal": "recall",
+                "handle": signal.handle,
+                "outcome": "failed",
+                "reason": "content not found in any store",
+            })
 
     def _handle_declare(self, signal: ResponseSignal) -> None:
         """Model declares dependency edges for a content block.
@@ -721,6 +791,19 @@ class Orchestrator:
                     signal.handle[:8],
                     [h[:8] for h in signal.depends_on],
                 )
+                self.signal_outcomes.append({
+                    "signal": "declare",
+                    "handle": signal.handle,
+                    "outcome": "accepted",
+                    "edges": len(signal.depends_on),
+                })
+            else:
+                self.signal_outcomes.append({
+                    "signal": "declare",
+                    "handle": signal.handle,
+                    "outcome": "no_effect",
+                    "reason": "edges already declared",
+                })
             return
 
     def _handle_trace(self, signal: ResponseSignal) -> None:

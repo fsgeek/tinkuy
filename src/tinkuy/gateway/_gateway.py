@@ -131,6 +131,7 @@ class GatewayConfig:
     enable_event_log: bool = True       # in-memory event log
     projector: Any = None              # Hamutay Projector sidecar (optional)
     tensor_store: Any = None           # TensorStore backend (optional)
+    lightweight: bool = False          # skip page table + memory protocol
 
 
 @dataclass
@@ -287,6 +288,8 @@ class Gateway:
             page_store=gw.page_store,
             context_limit=config.context_limit,
             event_bus=gw.bus,
+            tensor_store=gw.tensor_store,
+            projector=config.projector,
         )
         if restored is None:
             log.info("no checkpoint found — fresh start")
@@ -387,8 +390,11 @@ class Gateway:
 
         # Anthropic (default) — synthesize_messages handles page table
         # placement internally, respecting tool_result ordering.
-        payload = self._anthropic_live.synthesize_messages()
-        self._inject_memory_protocol(payload)
+        payload = self._anthropic_live.synthesize_messages(
+            skip_page_table=self.config.lightweight,
+        )
+        if not self.config.lightweight:
+            self._inject_memory_protocol(payload)
 
         # Pre-flight validation — catch layout violations before the wire
         from tinkuy.formats.validate import validate_anthropic_payload
@@ -551,15 +557,14 @@ class Gateway:
                 len(text), text[:200],
             )
 
-        # Stash signal data for telemetry persistence
+        # Stash the full response and signal data for telemetry.
+        # The response text is the primary research data — without it
+        # we cannot diagnose signal parsing failures after the fact.
         if self._pending_turn_context is not None:
+            self._pending_turn_context["response_text"] = text or ""
             self._pending_turn_context["signals"] = {
                 "parsed_count": len(signals),
-                "signals": [
-                    {"type": s["type"], "handle": s.get("handle", "")}
-                    for s in signals
-                ],
-                "response_text_len": len(text) if text else 0,
+                "signals": signals,  # full signal dicts, not summaries
                 "contains_yuyay": bool(text and "yuyay" in text.lower()),
             }
 
@@ -591,14 +596,23 @@ class Gateway:
         if api_total > 0:
             overhead = max(0, api_total - projection_tokens)
 
-            # Use actual overhead each turn — no smoothing. The overhead
-            # has a stable component (client tools/system) and a growing
-            # component (page table). Smoothing hides the growth.
-            self._client_overhead_tokens = overhead
+            # High-water mark with decay. Overhead oscillates wildly
+            # (24k-67k between turns) as Claude Code spawns/reaps
+            # subagents. Using point estimates causes the pressure
+            # scheduler to budget incorrectly on alternating turns.
+            #
+            # Strategy: always budget for the worst recent overhead.
+            # Decay the high-water mark by 5% per turn so it doesn't
+            # get permanently stuck at a transient spike.
+            if self._client_overhead_tokens is None:
+                self._client_overhead_tokens = overhead
+            else:
+                decayed = int(self._client_overhead_tokens * 0.95)
+                self._client_overhead_tokens = max(overhead, decayed)
 
             # Feed overhead into pressure scheduler so it knows the
             # real budget available for projection content
-            self.orchestrator.scheduler.overhead_tokens = overhead
+            self.orchestrator.scheduler.overhead_tokens = self._client_overhead_tokens
 
         log.info(
             "  telemetry | %s in=%d+%dcache out=%d overhead=%s",
@@ -685,6 +699,13 @@ class Gateway:
                 "ttfb": telemetry.ttfb,
                 "duration": telemetry.duration,
             },
+            # Cooperative signals — full parse results
+            "signals": ctx.get("signals", {}),
+            # Raw response text — the primary research data
+            "response_text": ctx.get("response_text", ""),
+            # Full response JSON (non-streaming) — preserves structure
+            # that text extraction discards (tool_use, thinking, etc.)
+            "response_json": ctx.get("response_json"),
             # Eviction activity
             "eviction": eviction_data,
             # Derived — overhead calibration after this turn
@@ -961,7 +982,18 @@ def _merge_system(
     new_parts = [p for p in gw_parts
                  if isinstance(p, dict) and p.get("text", "") not in client_texts]
 
-    return client_parts + new_parts
+    merged = client_parts + new_parts
+
+    # Strip all cache_control from merged system parts.
+    # The synthesizer (_collect_system) is the sole cache authority
+    # for system blocks — it places exactly one breakpoint on the
+    # last gateway system block. Client system parts may carry stale
+    # cache_control from their own API interactions.
+    for part in merged:
+        if isinstance(part, dict):
+            part.pop("cache_control", None)
+
+    return merged
 
 
 def _extract_response_content_from_json(

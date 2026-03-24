@@ -117,7 +117,8 @@ class PressureScheduler:
         )
 
     def score_candidate(
-        self, block: ContentBlock, current_turn: int
+        self, block: ContentBlock, current_turn: int,
+        dependents: int = 0,
     ) -> EvictionCandidate:
         """Score a single block for eviction candidacy.
 
@@ -126,6 +127,7 @@ class PressureScheduler:
         - Age since last access (older = more evictable)
         - Size (larger blocks free more space)
         - Fault history (frequently recalled = less evictable)
+        - Dependency edges (blocks depended on by others = less evictable)
         """
         reasons: list[str] = []
         score = 0.0
@@ -162,12 +164,35 @@ class PressureScheduler:
                 f"fault_count={block.access.fault_count} (penalty)"
             )
 
+        # Edge penalty: blocks that other blocks depend on are load-bearing.
+        # Evicting them breaks the coherence graph — downstream blocks lose
+        # their provenance chain. Each dependent adds a penalty.
+        if dependents > 0:
+            edge_penalty = dependents * 8.0
+            score -= edge_penalty
+            reasons.append(f"dependents={dependents} (edge penalty)")
+
         # Already nominated? Slight bonus.
         if block.status == ContentStatus.PENDING_REMOVAL:
             score += 5.0
             reasons.append("already pending removal")
 
         return EvictionCandidate(block=block, score=score, reasons=reasons)
+
+    def _build_dependent_counts(self, projection: Projection) -> dict[str, int]:
+        """Build a reverse index: handle → number of blocks that depend on it.
+
+        Walks all blocks in all regions, collecting depends_on edges.
+        Returns a count of how many live blocks reference each handle.
+        """
+        counts: dict[str, int] = {}
+        for region in projection.regions.values():
+            for block in region.blocks:
+                if block.status == ContentStatus.AVAILABLE:
+                    continue  # evicted blocks don't count as live dependents
+                for dep in block.metadata.get("depends_on", []):
+                    counts[dep] = counts.get(dep, 0) + 1
+        return counts
 
     def select_candidates(
         self, projection: Projection, *, limit: int = 10
@@ -178,6 +203,7 @@ class PressureScheduler:
         tensors). R0, R1, R4 are not candidates.
         """
         candidates: list[EvictionCandidate] = []
+        dep_counts = self._build_dependent_counts(projection)
 
         for rid in (RegionID.EPHEMERAL, RegionID.DURABLE):
             region = projection.region(rid)
@@ -188,7 +214,10 @@ class PressureScheduler:
                 # Skip tensors in R2 — they're the compressed survivors
                 if rid == RegionID.DURABLE and block.kind == ContentKind.TENSOR:
                     continue
-                candidate = self.score_candidate(block, projection.turn)
+                candidate = self.score_candidate(
+                    block, projection.turn,
+                    dependents=dep_counts.get(block.handle, 0),
+                )
                 candidates.append(candidate)
 
         # Sort by score descending (most evictable first)

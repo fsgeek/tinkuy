@@ -142,7 +142,7 @@ class GeminiInboundAdapter:
 
     def parse_request(self, body: dict[str, Any]) -> list[InboundEvent]:
         """Parse a Gemini GenerateContentRequest into InboundEvents."""
-        log.info("Parsing Gemini request: %s", json.dumps(body)[:500])
+        log.info("Parsing Gemini request: %s", json.dumps(body, default=str))
         events = []
         contents = body.get("contents", [])
         

@@ -12,10 +12,13 @@ client messages. The projection is the source of truth.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from tinkuy.core.adapter import _has_content, coalesce_episodes
 from tinkuy.core.orchestrator import Orchestrator
+
+log = logging.getLogger(__name__)
 from tinkuy.core.regions import (
     ContentBlock,
     ContentKind,
@@ -36,8 +39,13 @@ _ALLOWED_BLOCK_KEYS: dict[str, set[str]] = {
 }
 
 
-def _sanitize_content_block(block: dict[str, Any]) -> dict[str, Any]:
-    """Strip fields the Anthropic API won't accept on re-submission."""
+def _to_wire_format(block: dict[str, Any]) -> dict[str, Any]:
+    """Prepare a gateway-owned content block for the Anthropic wire format.
+
+    Retains only fields the API accepts for each block type.
+    The gateway has already made its transform decision for this block;
+    this is the final step before it goes on the wire.
+    """
     if not isinstance(block, dict):
         return block
     block_type = block.get("type", "")
@@ -63,13 +71,19 @@ class LiveAdapter:
         self.last_repair_counts: dict[str, int] = {}
         self.last_page_table_tokens: int = 0
 
-    def synthesize_messages(self) -> dict[str, Any]:
+    def synthesize_messages(
+        self, *, skip_page_table: bool = False,
+    ) -> dict[str, Any]:
         """Synthesize a complete Anthropic API messages payload.
 
         Reads the projection regions and constructs a valid messages
         array with proper user/assistant alternation. The page table
         is injected here (not by the gateway) because placement must
         respect tool_result ordering and other layout constraints.
+
+        skip_page_table: If True, omit the page table and signal feedback.
+        Used for lightweight subagent sessions where memory management
+        overhead exceeds the value it provides.
         """
         projection = self.orchestrator.projection
         payload: dict[str, Any] = {}
@@ -85,12 +99,15 @@ class LiveAdapter:
         # Page table → last user message, after any tool_result blocks.
         # The page table is per-turn volatile and must NOT go in the
         # system block (cache-busting) or before tool_results (API error).
-        page_table = self.synthesize_page_table()
-        if page_table:
-            self._inject_page_table(messages, page_table)
-            # Track page table size for telemetry — this is the gateway's
-            # own contribution to the wire, invisible to region accounting.
-            self.last_page_table_tokens = len(page_table) // 4  # rough estimate
+        if not skip_page_table:
+            page_table = self.synthesize_page_table()
+            if page_table:
+                self._inject_page_table(messages, page_table)
+                # Track page table size for telemetry — this is the gateway's
+                # own contribution to the wire, invisible to region accounting.
+                self.last_page_table_tokens = len(page_table) // 4  # rough estimate
+        else:
+            self.last_page_table_tokens = 0
 
         payload["messages"] = messages
         return payload
@@ -492,15 +509,12 @@ class LiveAdapter:
     ) -> list[dict[str, Any]]:
         """Place cache breakpoints at region boundaries, strip annotations.
 
-        Anthropic caches from the start of the request up to each
-        cache_control breakpoint (max 4). We use up to 2 in messages:
+        The synthesizer is the sole cache_control authority. This method:
+        1. Strips ALL cache_control from every content block (clearing
+           stale breakpoints inherited from stored API responses)
+        2. Places exactly its own breakpoints at region boundaries
 
-        1. Last R2 (durable) message — the stable curated content
-        2. Last R3 (ephemeral) message — stable between turns, only
-           changes when eviction runs
-
-        R4 (current turn) is never cached — it changes every turn.
-        This gives us: system(1) + R2(1) + R3(1) = 3 of 4 budget.
+        Budget: system(1) + R2(1) + R3(1) = 3 of 4. R4 is never cached.
 
         cache_control goes on a content block, not the message dict,
         so we convert the message's string content to a content array.
@@ -522,6 +536,7 @@ class LiveAdapter:
         if last_ephemeral_idx is not None:
             breakpoint_indices.add(last_ephemeral_idx)
 
+        cache_control_log: list[str] = []
         result: list[dict[str, Any]] = []
         for i, msg in enumerate(messages):
             clean = {k: v for k, v in msg.items() if not k.startswith("_")}
@@ -529,8 +544,12 @@ class LiveAdapter:
             # Sanitize content blocks — strip fields the API won't accept
             if isinstance(clean.get("content"), list):
                 clean["content"] = [
-                    _sanitize_content_block(b) for b in clean["content"]
+                    _to_wire_format(b) for b in clean["content"]
                 ]
+                # Strip ALL inherited cache_control — we place our own below
+                for block in clean["content"]:
+                    if isinstance(block, dict):
+                        block.pop("cache_control", None)
 
             if i in breakpoint_indices:
                 # Promote to content array with cache_control on last block
@@ -543,9 +562,17 @@ class LiveAdapter:
                     }]
                 elif isinstance(content, list) and content:
                     content[-1]["cache_control"] = {"type": "ephemeral"}
+                tier = msg.get("_cache_tier", "?")
+                cache_control_log.append(
+                    f"msg[{i}] role={clean.get('role')} tier={tier}"
+                )
 
             result.append(clean)
 
+        log.debug(
+            "cache_control placements in messages: %s",
+            cache_control_log or "none",
+        )
         return result
 
     def synthesize_page_table(self) -> str:
@@ -606,6 +633,19 @@ class LiveAdapter:
             if e.get("depends_on"):
                 attrs += f' depends_on="{",".join(e["depends_on"])}"'
             lines.append(f'  <entry {attrs}/>')
+
+        # Signal feedback: tell the model what happened to its signals
+        outcomes = self.orchestrator.signal_outcomes
+        if outcomes:
+            lines.append("  <signal-feedback>")
+            for o in outcomes:
+                attrs = f'signal="{o["signal"]}" handle="{o["handle"]}" outcome="{o["outcome"]}"'
+                if o.get("reason"):
+                    attrs += f' reason="{o["reason"]}"'
+                if o.get("edges"):
+                    attrs += f' edges="{o["edges"]}"'
+                lines.append(f'    <outcome {attrs}/>')
+            lines.append("  </signal-feedback>")
 
         lines.append("</yuyay-page-table>")
         return "\n".join(lines)

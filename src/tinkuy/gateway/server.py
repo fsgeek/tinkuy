@@ -92,6 +92,25 @@ def create_app(
     # Per-session gateways, keyed by session ID or a default
     gateways: dict[str, Gateway] = {}
 
+    def _extract_cch(system: Any) -> str | None:
+        """Extract cch= value from billing header in system prompt.
+
+        Claude Code embeds 'x-anthropic-billing-header: ... cch=XXXXX;'
+        in a system prompt block. The cch hash identifies the session
+        configuration — different for parent vs subagent.
+        """
+        if not system:
+            return None
+        parts = system if isinstance(system, list) else [system]
+        for part in parts:
+            text = part.get("text", "") if isinstance(part, dict) else str(part)
+            if "cch=" in text:
+                import re
+                m = re.search(r"cch=([a-f0-9]+)", text)
+                if m:
+                    return m.group(1)
+        return None
+
     def _extract_session_id(
         header_value: Optional[str],
         body: dict[str, Any] | None = None,
@@ -120,13 +139,24 @@ def create_app(
     def get_gateway(session_id: Optional[str]) -> Gateway:
         key = session_id or "__default__"
         if key not in gateways:
+            # Subagent detection: session keys with ":" are subagents
+            # (session_id:cch). They get lightweight mode — no page table,
+            # no memory protocol injection. Tinkuy still tracks telemetry
+            # but doesn't add context overhead. This prevents the thrashing
+            # pattern where the page table (median 5k tokens, up to 19k)
+            # consumes context that the subagent needs for file reads.
+            is_subagent = ":" in (key or "")
             cfg = GatewayConfig(
                 context_limit=config.context_limit,
                 data_dir=config.data_dir,
                 session_id=session_id,
                 enable_console=config.enable_console,
                 enable_event_log=config.enable_event_log,
+                tensor_store=config.tensor_store,
+                lightweight=is_subagent,
             )
+            if is_subagent:
+                log.info("subagent session %s — lightweight mode", key)
             gw = Gateway.resume(cfg)
             if gw is None:
                 gw = Gateway(cfg)
@@ -204,7 +234,17 @@ def create_app(
         session_id = _extract_session_id(
             request.headers.get("x-tinkuy-session"), body
         )
-        gw = get_gateway(session_id)
+        # Subagent isolation: Claude Code embeds a cch= hash in the
+        # billing header that identifies the session configuration.
+        # Subagents (scourers, agent tools) have a different cch than
+        # the parent. Route them to their own gateway instance so they
+        # get proper context management without corrupting the parent.
+        request_cch = _extract_cch(body.get("system"))
+        if request_cch and session_id:
+            session_key = f"{session_id}:{request_cch}"
+        else:
+            session_key = session_id
+        gw = get_gateway(session_key)
 
         # Defense in depth: if max_tokens=1 and non-streaming, this is
         # a token-counting probe (Claude Code fallback when count_tokens
@@ -314,7 +354,7 @@ def create_app(
                 log.error(
                     "x upstream error | status=%d body=%s",
                     upstream_resp.status_code,
-                    upstream_resp.text[:2000],
+                    upstream_resp.text,
                 )
                 _dump_rejected_payload(upstream_body, upstream_resp.status_code)
                 return Response(
@@ -324,6 +364,10 @@ def create_app(
                 )
 
             resp_data = upstream_resp.json()
+            # Persist the full response JSON for reproducibility.
+            # The ingest path extracts text but discards structure.
+            if gw._pending_turn_context is not None:
+                gw._pending_turn_context["response_json"] = resp_data
             gw.ingest_response_json(resp_data)
 
             # Build telemetry from non-streaming response
@@ -498,7 +542,7 @@ async def _handle_error(
     log.error(
         "x upstream error | status=%d body=%s",
         upstream_resp.status_code,
-        error_body.decode("utf-8", errors="replace")[:2000],
+        error_body.decode("utf-8", errors="replace"),
     )
     log.error("x response headers: %s", dict(upstream_resp.headers))
 
@@ -618,7 +662,7 @@ def _dump_rejected_payload(body: dict[str, Any], status: int) -> None:
     if extra:
         log.error(
             "x non-standard body fields: %s",
-            json.dumps(extra, indent=2, default=str)[:1000],
+            json.dumps(extra, indent=2, default=str),
         )
 
 

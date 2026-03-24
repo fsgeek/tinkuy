@@ -1,0 +1,72 @@
+This is BibTeX, Version 0.99d (TeX Live 2025)
+Capacity: max_strings=200000, hash_size=200000, hash_prime=170003
+The top-level auxiliary file: paper.aux
+The style file: ACM-Reference-Format.bst
+Reallocated singl_function (elt_size=4) to 100 items from 50.
+Reallocated singl_function (elt_size=4) to 100 items from 50.
+Reallocated wiz_functions (elt_size=4) to 6000 items from 3000.
+Database file #1: references.bib
+Reallocated singl_function (elt_size=4) to 100 items from 50.
+Reallocated glb_str_ptr (elt_size=4) to 20 items from 10.
+Reallocated global_strs (elt_size=200001) to 20 items from 10.
+Reallocated glb_str_end (elt_size=4) to 20 items from 10.
+Reallocated singl_function (elt_size=4) to 100 items from 50.
+Reallocated wiz_functions (elt_size=4) to 9000 items from 6000.
+Warning--no number and no volume in beltagy2020longformer
+Warning--page numbers missing in both pages and numpages fields in beltagy2020longformer
+Warning--no number and no volume in chevalier2023autocompressors
+Warning--page numbers missing in both pages and numpages fields in chevalier2023autocompressors
+Warning--no number and no volume in child2019generating
+Warning--page numbers missing in both pages and numpages fields in child2019generating
+Warning--no number and no volume in jiang2023llmlingua
+Warning--page numbers missing in both pages and numpages fields in jiang2023llmlingua
+Warning--can't use both volume and number fields in kilburn1962atlas
+Warning--empty publisher in kilburn1962atlas
+Warning--empty address in kilburn1962atlas
+Warning--empty publisher in lewis2020rag
+Warning--empty address in lewis2020rag
+Warning--no number and no volume in packer2023memgpt
+Warning--page numbers missing in both pages and numpages fields in packer2023memgpt
+Warning--no journal in zaheer2020bigbird
+You've used 12 entries,
+            6056 wiz_defined-function locations,
+            1546 strings with 20138 characters,
+and the built_in function-call counts, 13656 in all, are:
+= -- 1786
+> -- 524
+< -- 0
++ -- 180
+- -- 178
+* -- 1021
+:= -- 1367
+add.period$ -- 62
+call.type$ -- 12
+change.case$ -- 102
+chr.to.int$ -- 12
+cite$ -- 28
+duplicate$ -- 1120
+empty$ -- 799
+format.name$ -- 210
+if$ -- 3326
+int.to.chr$ -- 2
+int.to.str$ -- 1
+missing$ -- 42
+newline$ -- 140
+num.names$ -- 84
+pop$ -- 459
+preamble$ -- 1
+purify$ -- 198
+quote$ -- 0
+skip$ -- 381
+stack$ -- 0
+substring$ -- 930
+swap$ -- 94
+text.length$ -- 0
+text.prefix$ -- 0
+top$ -- 0
+type$ -- 248
+warning$ -- 16
+while$ -- 67
+width$ -- 0
+write$ -- 266
+(There were 16 warnings)
