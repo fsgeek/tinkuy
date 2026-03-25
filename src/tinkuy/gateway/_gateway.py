@@ -1192,6 +1192,33 @@ def _construct_message(msg: dict[str, Any]) -> dict[str, Any]:
     return {"role": msg["role"], "content": constructed}
 
 
+def _parse_client_system(
+    client_system: list[dict[str, Any] | str],
+) -> list[InboundEvent]:
+    """Parse client system blocks into InboundEvents for projection ingestion.
+
+    All client system blocks become SYSTEM_UPDATE events placed in R1.
+    cache_control is stripped — the gateway owns cache placement.
+    This is the ingestion side of the anti-proxy boundary.
+    """
+    events: list[InboundEvent] = []
+    for i, block in enumerate(client_system):
+        if isinstance(block, str):
+            text = block
+        elif isinstance(block, dict):
+            text = block.get("text", "")
+        else:
+            continue
+        if not text:
+            continue
+        events.append(InboundEvent(
+            type=EventType.SYSTEM_UPDATE,
+            content=text,
+            label=f"client-system-{i}",
+        ))
+    return events
+
+
 def _extract_tool_calls(
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
