@@ -1077,7 +1077,7 @@ def compute_message_suffix(
 
     # Case 1: last message is user with no tool_results → 1 message
     if last.get("role") == "user" and not _has_tool_results(last):
-        return [_strip_cache_control(last)]
+        return [_construct_message(last)]
 
     # Case 2: last message is user with tool_results → 3 messages
     if last.get("role") == "user" and _has_tool_results(last):
@@ -1085,7 +1085,7 @@ def compute_message_suffix(
             # Degenerate: tool_result with no preceding assistant.
             # Pass through and let the validator catch it.
             log.warning("tool_result user message with no preceding message")
-            return [_strip_cache_control(last)]
+            return [_construct_message(last)]
 
         assistant = messages[-2]
         if assistant.get("role") != "assistant":
@@ -1093,24 +1093,24 @@ def compute_message_suffix(
                 "expected assistant before tool_result user, got %s",
                 assistant.get("role"),
             )
-            return [_strip_cache_control(last)]
+            return [_construct_message(last)]
 
         # Strip assistant to tool_use blocks only (drop thinking, text)
         stripped = _strip_to_tool_use(assistant)
         if stripped is None:
             # Assistant had no tool_use blocks — degrade to Case 1
             log.warning("assistant message has no tool_use blocks after stripping")
-            return [_strip_cache_control(last)]
+            return [_construct_message(last)]
 
         return [
             {"role": "user", "content": "[continued]"},
             stripped,
-            _strip_cache_control(last),
+            _construct_message(last),
         ]
 
     # Fallback: last message isn't user (shouldn't happen with Claude Code)
     log.warning("last message role is %s, not user", last.get("role"))
-    return [_strip_cache_control(last)]
+    return [_construct_message(last)]
 
 
 def _has_tool_results(msg: dict[str, Any]) -> bool:
@@ -1145,24 +1145,51 @@ def _strip_to_tool_use(msg: dict[str, Any]) -> dict[str, Any] | None:
     return {"role": "assistant", "content": tool_use_blocks}
 
 
-def _strip_cache_control(msg: dict[str, Any]) -> dict[str, Any]:
-    """Strip cache_control from all content blocks in a message.
+def _construct_message(msg: dict[str, Any]) -> dict[str, Any]:
+    """Construct a new message from a client message.
 
-    The gateway is the cache authority — client cache_control in
-    messages would conflict with the gateway's system-block breakpoints
-    (e.g. client 1h TTL after gateway's 5m ephemeral → API 400).
+    Builds a fresh message dict with only the fields needed.
+    This is an allowlist, not a blocklist — unknown client fields
+    (cache_control, future API additions) don't leak through.
     """
     content = msg.get("content", "")
+
+    # String content: pass through as-is
     if not isinstance(content, list):
-        return msg
+        return {"role": msg["role"], "content": content}
 
-    cleaned = []
+    # List content: construct each block from known fields only
+    constructed: list[dict[str, Any]] = []
     for block in content:
-        if isinstance(block, dict) and "cache_control" in block:
-            block = {k: v for k, v in block.items() if k != "cache_control"}
-        cleaned.append(block)
+        if not isinstance(block, dict):
+            constructed.append(block)
+            continue
 
-    return {**msg, "content": cleaned}
+        btype = block.get("type", "")
+        if btype == "tool_result":
+            b: dict[str, Any] = {
+                "type": "tool_result",
+                "tool_use_id": block["tool_use_id"],
+            }
+            if "content" in block:
+                b["content"] = block["content"]
+            if block.get("is_error"):
+                b["is_error"] = True
+            constructed.append(b)
+        elif btype == "text":
+            constructed.append({"type": "text", "text": block.get("text", "")})
+        elif btype == "image":
+            # Pass through image blocks structurally
+            b = {"type": "image", "source": block["source"]}
+            constructed.append(b)
+        else:
+            # Unknown block type — pass through but strip cache_control
+            # as a safety net. Log so we learn about new types.
+            b = {k: v for k, v in block.items() if k != "cache_control"}
+            log.info("unknown content block type in message: %s", btype)
+            constructed.append(b)
+
+    return {"role": msg["role"], "content": constructed}
 
 
 def _extract_tool_calls(
