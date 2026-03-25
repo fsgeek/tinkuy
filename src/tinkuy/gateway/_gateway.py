@@ -92,7 +92,7 @@ from tinkuy.core.orchestrator import (
 )
 from tinkuy.core.events import EventKind
 from tinkuy.core.pressure import PressureZone
-from tinkuy.core.regions import ContentStatus, Projection
+from tinkuy.core.regions import ContentKind, ContentStatus, Projection, RegionID
 from tinkuy.core.store import (
     CheckpointStore,
     FileCheckpointStore,
@@ -220,6 +220,7 @@ class Gateway:
         # Cleared when a turn has no tool calls. Collision = thrashing.
         self._tool_call_hashes: set[str] = set()
         self._thrash_count: int = 0  # for telemetry
+        self._client_system_fingerprint: str | None = None
         self._pending_turn_context: dict[str, Any] | None = None
         self._telemetry_path: Path | None = None
         if self.config.data_dir and self.config.session_id:
@@ -227,6 +228,47 @@ class Gateway:
                 Path(self.config.data_dir) / "sessions"
                 / self.config.session_id / "telemetry.jsonl"
             )
+
+    def _ingest_client_system(
+        self, client_system: list[dict[str, Any] | str],
+    ) -> None:
+        """Ingest client system blocks into the projection's R1.
+
+        Fingerprint-gated: only ingests on first call or when the
+        system blocks change. This is the anti-proxy boundary — client
+        system content enters the projection, never the payload.
+        """
+        # Fingerprint: hash of full content (not just lengths — content
+        # can change at the same length, e.g. updated CLAUDE.md)
+        hasher = hashlib.sha256()
+        for block in client_system:
+            if isinstance(block, str):
+                hasher.update(block.encode())
+            elif isinstance(block, dict):
+                hasher.update(block.get("text", "").encode())
+        fingerprint = hasher.hexdigest()[:16]
+
+        if fingerprint == self._client_system_fingerprint:
+            return  # Unchanged — skip re-ingestion
+
+        self._client_system_fingerprint = fingerprint
+
+        # Clear existing client system blocks from R1 (they're stale).
+        # Preserve non-client blocks (e.g. memory-protocol).
+        r1 = self.orchestrator.projection.region(RegionID.SYSTEM)
+        r1.blocks = [b for b in r1.blocks
+                     if not b.label.startswith("client-system-")]
+
+        # Parse into events and route through the orchestrator's
+        # existing SYSTEM_UPDATE → R1 placement path.
+        events = _parse_client_system(client_system)
+        for event in events:
+            self.orchestrator._place_event(event)
+
+        log.info(
+            "ingested %d client system blocks into R1 (fingerprint=%s)",
+            len(events), fingerprint,
+        )
 
     def _setup_stores(self) -> None:
         """Initialize page store, checkpoint store, and tensor store.
@@ -574,13 +616,19 @@ class Gateway:
             client_body, request_messages,
         )
 
-        # Extract client system blocks — these go first in the system array.
-        # The synthesizer handles placement and cache_control.
-        client_system = client_body.get("system")
-        if isinstance(client_system, str):
-            client_system = [{"type": "text", "text": client_system}]
-        elif not isinstance(client_system, list):
-            client_system = None
+        # Ingest client system blocks into the projection (R1).
+        # Fingerprint-gated: skip if unchanged since last turn.
+        raw_system = client_body.get("system")
+        if isinstance(raw_system, str):
+            raw_system = [{"type": "text", "text": raw_system}]
+        elif not isinstance(raw_system, list):
+            raw_system = None
+
+        if raw_system:
+            self._ingest_client_system(raw_system)
+
+        # Still pass client_system to process_turn for now (removed in Task 3)
+        client_system = raw_system
 
         # Compute the minimal message suffix for the API. This is
         # independent of projection ingestion — the suffix satisfies
