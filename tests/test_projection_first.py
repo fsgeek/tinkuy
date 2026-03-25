@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+
 from tinkuy.core.orchestrator import EventType, InboundEvent, Orchestrator
 from tinkuy.core.regions import ContentKind, ContentStatus, RegionID
 from tinkuy.gateway import Gateway, GatewayConfig
@@ -134,3 +136,52 @@ def test_client_system_reingested_when_fingerprint_changes():
     r1 = gw.projection.region(RegionID.SYSTEM)
     r1_text = " ".join(b.content for b in r1.present_blocks())
     assert "Version 2" in r1_text
+
+
+def test_synthesize_has_no_client_system_parameter():
+    """Structural impediment: _synthesize cannot accept raw client data."""
+    from tinkuy.gateway._gateway import Gateway
+
+    sig = inspect.signature(Gateway._synthesize)
+    param_names = list(sig.parameters.keys())
+
+    assert "client_system" not in param_names, (
+        "_synthesize still accepts client_system — the proxy escape hatch is open"
+    )
+
+
+def test_process_turn_has_no_client_system_parameter():
+    """Structural impediment: process_turn cannot accept raw client data."""
+    from tinkuy.gateway._gateway import Gateway
+
+    sig = inspect.signature(Gateway.process_turn)
+    param_names = list(sig.parameters.keys())
+
+    assert "client_system" not in param_names, (
+        "process_turn still accepts client_system — the proxy escape hatch is open"
+    )
+
+
+def test_payload_system_blocks_come_only_from_projection():
+    """The system array contains only projection-sourced blocks."""
+    gw = Gateway(GatewayConfig(lightweight=True))
+
+    client_body = {
+        "system": [
+            {"type": "text", "text": "Client instruction alpha."},
+        ],
+        "messages": [{"role": "user", "content": "hello"}],
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 8096,
+    }
+
+    payload = gw.prepare_request(client_body)
+
+    # Content should be present (via R1 projection)
+    system_texts = [b.get("text", "") for b in payload.get("system", [])]
+    full_text = "\n".join(system_texts)
+    assert "Client instruction alpha." in full_text
+
+    # R1 in the projection should have the content
+    r1 = gw.projection.region(RegionID.SYSTEM)
+    assert r1.block_count >= 1

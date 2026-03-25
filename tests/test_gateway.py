@@ -244,7 +244,8 @@ def test_prepare_request_returns_system_blocks_array():
 
 
 
-def test_prepare_request_places_client_system_first():
+def test_prepare_request_places_client_system_in_r1():
+    """Client system blocks are ingested into R1 and appear in the system array."""
     gw = Gateway()
     client_body = {
         "model": "claude-sonnet-4-20250514",
@@ -262,9 +263,11 @@ def test_prepare_request_places_client_system_first():
     upstream = gw.prepare_request(client_body)
 
     system = upstream["system"]
-    assert len(system) >= 2
-    assert system[0]["text"] == "Client block 1"
-    assert system[1]["text"] == "Client block 2"
+    assert len(system) >= 1
+    # Client content should appear in the system array via R1 projection
+    full_text = "\n".join(b.get("text", "") for b in system)
+    assert "Client block 1" in full_text
+    assert "Client block 2" in full_text
 
 
 

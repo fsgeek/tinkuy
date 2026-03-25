@@ -379,7 +379,6 @@ class Gateway:
         tool_results: list[dict[str, Any]] | None = None,
         events: list[InboundEvent] | None = None,
         format: APIFormat = APIFormat.ANTHROPIC,
-        client_system: list[dict[str, Any]] | None = None,
         message_suffix: list[dict[str, Any]] | None = None,
     ) -> TurnResult:
         """Process a single turn.
@@ -391,8 +390,6 @@ class Gateway:
         synthesizes the outbound payload.  The projection itself is
         format-agnostic.
 
-        client_system: The client's original system blocks, passed
-            through to the synthesizer for placement in the system array.
         message_suffix: Pre-computed minimal message suffix from
             compute_message_suffix. Used directly as the messages array
             in the API payload.
@@ -430,7 +427,6 @@ class Gateway:
         # the pre-computed suffix (or fall back to user_content).
         payload = self._synthesize(
             format,
-            client_system=client_system,
             message_suffix=message_suffix,
             user_content=user_content,
         )
@@ -449,7 +445,6 @@ class Gateway:
     def _synthesize(
         self,
         format: APIFormat,
-        client_system: list[dict[str, Any]] | None = None,
         message_suffix: list[dict[str, Any]] | None = None,
         user_content: str | None = None,
     ) -> dict[str, Any]:
@@ -460,10 +455,10 @@ class Gateway:
         stability. The messages array is the pre-computed suffix from
         compute_message_suffix (1 or 3 messages).
 
-        client_system: The client's original system blocks (Claude Code
-            sends instructions, tools, CLAUDE.md, skills). These are
-            placed first in the system array — the gateway's projection
-            content comes after.
+        All system blocks come from the projection. Client system
+        content is ingested into R1 by prepare_request() before this
+        method is called — there is no raw pass-through.
+
         message_suffix: Pre-computed minimal message suffix. Used
             directly as the messages array.
         user_content: Fallback for callers that don't provide a suffix
@@ -479,27 +474,8 @@ class Gateway:
             skip_page_table=self.config.lightweight,
         )
 
-        # Place client system blocks first, gateway blocks after.
-        # The gateway is the cache authority — strip client cache_control.
-        if client_system:
-            cleaned = []
-            for block in client_system:
-                if isinstance(block, dict):
-                    clean = {k: v for k, v in block.items()
-                             if k != "cache_control"}
-                    cleaned.append(clean)
-                elif isinstance(block, str):
-                    cleaned.append({"type": "text", "text": block})
-            # Client blocks are R1 (stable forever from gateway's perspective).
-            # Place cache_control breakpoint on the last client block.
-            if cleaned:
-                cleaned[-1]["cache_control"] = {"type": "ephemeral"}
-            payload["system"] = cleaned + payload.get("system", [])
-
-        # Inject memory protocol into R1 tier AFTER client blocks are
-        # placed. This ensures the injection finds the client breakpoint
-        # (not the R3 breakpoint from the synthesizer), placing the
-        # protocol correctly in the R1 tier where it gets cached.
+        # Inject memory protocol into R1 tier.
+        # TODO(task4): Move memory protocol into the projection.
         if not self.config.lightweight:
             self._inject_memory_protocol_r1(payload)
 
@@ -627,9 +603,6 @@ class Gateway:
         if raw_system:
             self._ingest_client_system(raw_system)
 
-        # Still pass client_system to process_turn for now (removed in Task 3)
-        client_system = raw_system
-
         # Compute the minimal message suffix for the API. This is
         # independent of projection ingestion — the suffix satisfies
         # API constraints while the projection gets the semantic content.
@@ -639,7 +612,6 @@ class Gateway:
             user_content=user_content or "",
             tool_results=tool_results,
             format=APIFormat.ANTHROPIC,
-            client_system=client_system,
             message_suffix=message_suffix,
         )
 
@@ -655,8 +627,8 @@ class Gateway:
         )
 
         # Build complete upstream body.
-        # The synthesizer already placed client system blocks + gateway
-        # system blocks + messages. No merge needed.
+        # All system blocks come from the projection via the synthesizer.
+        # Client system content was ingested into R1 above.
         upstream: dict[str, Any] = {
             k: v for k, v in client_body.items()
             if k not in ("messages", "system")
