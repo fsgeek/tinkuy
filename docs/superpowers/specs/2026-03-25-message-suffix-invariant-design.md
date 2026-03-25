@@ -114,7 +114,7 @@ def compute_message_suffix(
 | Empty messages list | Return `[{role: user, content: "[continued]"}]` — degenerate, shouldn't happen |
 | Last message not user role | Return `[messages[-1]]` — pass through, let validator catch issues |
 | messages[-2] not assistant role | Log warning, return `[messages[-1]]` — degrade to case 1 |
-| Assistant has no tool_use blocks | Strip to empty content → log warning, use `[{type: text, text: "[no content]"}]` |
+| Assistant has no tool_use blocks after stripping | Degrade to Case 1 — return only user message. Validator catches orphan tool_results as safety net |
 | Multiple tool_use in one assistant | Keep all — user message will have matching tool_results |
 | tool_result with text content mixed | Preserve verbatim — client ordering is correct |
 

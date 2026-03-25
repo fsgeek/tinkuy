@@ -338,6 +338,7 @@ class Gateway:
         events: list[InboundEvent] | None = None,
         format: APIFormat = APIFormat.ANTHROPIC,
         client_system: list[dict[str, Any]] | None = None,
+        message_suffix: list[dict[str, Any]] | None = None,
     ) -> TurnResult:
         """Process a single turn.
 
@@ -350,6 +351,9 @@ class Gateway:
 
         client_system: The client's original system blocks, passed
             through to the synthesizer for placement in the system array.
+        message_suffix: Pre-computed minimal message suffix from
+            compute_message_suffix. Used directly as the messages array
+            in the API payload.
         """
         inbound = events or []
 
@@ -380,11 +384,12 @@ class Gateway:
         )
 
         # Synthesize API payload — adapter chosen per-request.
-        # For Anthropic, client_system and user_content are passed
-        # to the synthesizer so it can build the complete payload.
+        # System blocks come from the synthesizer; messages come from
+        # the pre-computed suffix (or fall back to user_content).
         payload = self._synthesize(
             format,
             client_system=client_system,
+            message_suffix=message_suffix,
             user_content=user_content,
         )
 
@@ -403,20 +408,24 @@ class Gateway:
         self,
         format: APIFormat,
         client_system: list[dict[str, Any]] | None = None,
+        message_suffix: list[dict[str, Any]] | None = None,
         user_content: str | None = None,
     ) -> dict[str, Any]:
         """Synthesize the outbound API payload for the given format.
 
         For ANTHROPIC format, uses the system-block synthesizer which
         puts the entire projection into system blocks ordered by
-        stability. The messages array contains only the current user turn.
+        stability. The messages array is the pre-computed suffix from
+        compute_message_suffix (1 or 3 messages).
 
         client_system: The client's original system blocks (Claude Code
             sends instructions, tools, CLAUDE.md, skills). These are
             placed first in the system array — the gateway's projection
             content comes after.
-        user_content: The current user message. Goes into the messages
-            array as the sole user message.
+        message_suffix: Pre-computed minimal message suffix. Used
+            directly as the messages array.
+        user_content: Fallback for callers that don't provide a suffix
+            (e.g. exerciser, tests). Wrapped in a single user message.
         """
         if format == APIFormat.GEMINI:
             payload = self._gemini_live.synthesize_request()
@@ -452,10 +461,18 @@ class Gateway:
         if not self.config.lightweight:
             self._inject_memory_protocol_r1(payload)
 
-        # Add the current user message to messages
-        if user_content:
+        # Messages: use pre-computed suffix if available, else wrap
+        # user_content as a single user message (for non-prepare_request
+        # callers like tests and exerciser).
+        if message_suffix:
+            payload["messages"] = message_suffix
+        elif user_content:
             payload["messages"] = [
                 {"role": "user", "content": user_content}
+            ]
+        else:
+            payload["messages"] = [
+                {"role": "user", "content": "[continued]"}
             ]
 
         # Pre-flight validation — catch layout violations before the wire
@@ -565,11 +582,17 @@ class Gateway:
         elif not isinstance(client_system, list):
             client_system = None
 
+        # Compute the minimal message suffix for the API. This is
+        # independent of projection ingestion — the suffix satisfies
+        # API constraints while the projection gets the semantic content.
+        message_suffix = compute_message_suffix(request_messages)
+
         turn_result = self.process_turn(
             user_content=user_content or "",
             tool_results=tool_results,
             format=APIFormat.ANTHROPIC,
             client_system=client_system,
+            message_suffix=message_suffix,
         )
 
         # Snapshot gateway state after processing (projection is updated)
@@ -1028,6 +1051,98 @@ class Gateway:
 
 
 # --- Helpers ---
+
+
+def compute_message_suffix(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Compute the minimal valid message suffix for the API.
+
+    The system-block architecture puts the conversation projection in
+    system blocks. The messages array contains only the structural
+    minimum required by the Anthropic API.
+
+    Returns 1 message (user turn) or 3 messages (tool_result turn).
+
+    Invariants:
+      - First message is always role=user
+      - If tool_results present, preceding assistant has matching tool_use
+      - Assistant messages stripped to tool_use blocks only
+      - Result passes validate_anthropic_payload (messages portion)
+    """
+    if not messages:
+        return [{"role": "user", "content": "[continued]"}]
+
+    last = messages[-1]
+
+    # Case 1: last message is user with no tool_results → 1 message
+    if last.get("role") == "user" and not _has_tool_results(last):
+        return [last]
+
+    # Case 2: last message is user with tool_results → 3 messages
+    if last.get("role") == "user" and _has_tool_results(last):
+        if len(messages) < 2:
+            # Degenerate: tool_result with no preceding assistant.
+            # Pass through and let the validator catch it.
+            log.warning("tool_result user message with no preceding message")
+            return [last]
+
+        assistant = messages[-2]
+        if assistant.get("role") != "assistant":
+            log.warning(
+                "expected assistant before tool_result user, got %s",
+                assistant.get("role"),
+            )
+            return [last]
+
+        # Strip assistant to tool_use blocks only (drop thinking, text)
+        stripped = _strip_to_tool_use(assistant)
+        if stripped is None:
+            # Assistant had no tool_use blocks — degrade to Case 1
+            log.warning("assistant message has no tool_use blocks after stripping")
+            return [last]
+
+        return [
+            {"role": "user", "content": "[continued]"},
+            stripped,
+            last,
+        ]
+
+    # Fallback: last message isn't user (shouldn't happen with Claude Code)
+    log.warning("last message role is %s, not user", last.get("role"))
+    return [last]
+
+
+def _has_tool_results(msg: dict[str, Any]) -> bool:
+    """Check if a message contains tool_result blocks."""
+    content = msg.get("content", "")
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(b, dict) and b.get("type") == "tool_result"
+        for b in content
+    )
+
+
+def _strip_to_tool_use(msg: dict[str, Any]) -> dict[str, Any] | None:
+    """Strip an assistant message to only tool_use blocks.
+
+    Returns a new message dict with only tool_use blocks in content,
+    or None if there are no tool_use blocks.
+    """
+    content = msg.get("content", [])
+    if not isinstance(content, list):
+        return None
+
+    tool_use_blocks = [
+        b for b in content
+        if isinstance(b, dict) and b.get("type") == "tool_use"
+    ]
+
+    if not tool_use_blocks:
+        return None
+
+    return {"role": "assistant", "content": tool_use_blocks}
 
 
 def _extract_tool_calls(

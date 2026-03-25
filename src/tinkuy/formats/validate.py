@@ -100,6 +100,32 @@ def _check_tool_pairing(
     messages: list[dict[str, Any]], result: ValidationResult
 ) -> None:
     """Rule 3+4: tool_use/tool_result pairing."""
+    # Check for orphan tool_results in user messages not preceded by
+    # an assistant with matching tool_use. This catches the case where
+    # a user message with tool_results appears first in the array.
+    for i, msg in enumerate(messages):
+        if msg.get("role") != "user":
+            continue
+        tool_result_ids = _extract_tool_result_ids(msg)
+        if not tool_result_ids:
+            continue
+        # Check preceding message
+        if i == 0 or messages[i - 1].get("role") != "assistant":
+            result.errors.append(ValidationError(
+                rule="tool_result_orphan",
+                message=f"tool_result with no preceding assistant: {tool_result_ids}",
+                location=f"messages[{i}]",
+            ))
+            continue
+        preceding_tool_use_ids = _extract_tool_use_ids(messages[i - 1])
+        orphans = tool_result_ids - preceding_tool_use_ids
+        if orphans:
+            result.errors.append(ValidationError(
+                rule="tool_result_orphan",
+                message=f"tool_result IDs without matching tool_use in preceding assistant: {orphans}",
+                location=f"messages[{i}]",
+            ))
+
     for i, msg in enumerate(messages):
         if msg.get("role") != "assistant":
             continue
