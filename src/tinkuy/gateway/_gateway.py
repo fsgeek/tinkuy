@@ -1077,7 +1077,7 @@ def compute_message_suffix(
 
     # Case 1: last message is user with no tool_results → 1 message
     if last.get("role") == "user" and not _has_tool_results(last):
-        return [last]
+        return [_strip_cache_control(last)]
 
     # Case 2: last message is user with tool_results → 3 messages
     if last.get("role") == "user" and _has_tool_results(last):
@@ -1085,7 +1085,7 @@ def compute_message_suffix(
             # Degenerate: tool_result with no preceding assistant.
             # Pass through and let the validator catch it.
             log.warning("tool_result user message with no preceding message")
-            return [last]
+            return [_strip_cache_control(last)]
 
         assistant = messages[-2]
         if assistant.get("role") != "assistant":
@@ -1093,24 +1093,24 @@ def compute_message_suffix(
                 "expected assistant before tool_result user, got %s",
                 assistant.get("role"),
             )
-            return [last]
+            return [_strip_cache_control(last)]
 
         # Strip assistant to tool_use blocks only (drop thinking, text)
         stripped = _strip_to_tool_use(assistant)
         if stripped is None:
             # Assistant had no tool_use blocks — degrade to Case 1
             log.warning("assistant message has no tool_use blocks after stripping")
-            return [last]
+            return [_strip_cache_control(last)]
 
         return [
             {"role": "user", "content": "[continued]"},
             stripped,
-            last,
+            _strip_cache_control(last),
         ]
 
     # Fallback: last message isn't user (shouldn't happen with Claude Code)
     log.warning("last message role is %s, not user", last.get("role"))
-    return [last]
+    return [_strip_cache_control(last)]
 
 
 def _has_tool_results(msg: dict[str, Any]) -> bool:
@@ -1143,6 +1143,26 @@ def _strip_to_tool_use(msg: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
     return {"role": "assistant", "content": tool_use_blocks}
+
+
+def _strip_cache_control(msg: dict[str, Any]) -> dict[str, Any]:
+    """Strip cache_control from all content blocks in a message.
+
+    The gateway is the cache authority — client cache_control in
+    messages would conflict with the gateway's system-block breakpoints
+    (e.g. client 1h TTL after gateway's 5m ephemeral → API 400).
+    """
+    content = msg.get("content", "")
+    if not isinstance(content, list):
+        return msg
+
+    cleaned = []
+    for block in content:
+        if isinstance(block, dict) and "cache_control" in block:
+            block = {k: v for k, v in block.items() if k != "cache_control"}
+        cleaned.append(block)
+
+    return {**msg, "content": cleaned}
 
 
 def _extract_tool_calls(

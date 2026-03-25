@@ -215,3 +215,47 @@ def test_assistant_no_tool_use_degrades_to_case_1():
     # Degrades to Case 1 — just the user message
     assert len(result) == 1
     assert result[0]["role"] == "user"
+
+
+# --- Cache control stripping ---
+
+
+def test_cache_control_stripped_from_user_message():
+    """Client cache_control on content blocks must be stripped."""
+    msgs = [
+        {"role": "user", "content": [
+            {"type": "text", "text": "hello",
+             "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+            {"type": "text", "text": "world"},
+        ]},
+    ]
+    result = compute_message_suffix(msgs)
+    for block in result[0]["content"]:
+        assert "cache_control" not in block
+
+
+def test_cache_control_stripped_from_tool_result_message():
+    """Cache_control stripped from tool_result user message too."""
+    msgs = [
+        {"role": "user", "content": "do something"},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t1", "name": "Read", "input": {}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1",
+             "content": "result",
+             "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+        ]},
+    ]
+    result = compute_message_suffix(msgs)
+    assert len(result) == 3
+    # The tool_result user message (result[2]) should have no cache_control
+    for block in result[2]["content"]:
+        assert "cache_control" not in block
+
+
+def test_string_content_unaffected_by_cache_strip():
+    """Messages with string content pass through unchanged."""
+    msgs = [{"role": "user", "content": "hello"}]
+    result = compute_message_suffix(msgs)
+    assert result[0]["content"] == "hello"
