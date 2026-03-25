@@ -572,6 +572,64 @@ class Orchestrator:
                 to_region="EPHEMERAL",
             )
 
+        # Promote stable R3 content to R2 (durable).
+        # A block that has survived in R3 for PROMOTION_AGE turns without
+        # mutation is likely reference material (file reads, large tool
+        # outputs) that benefits from the R2 cache breakpoint.
+        self._promote_stable_to_durable()
+
+    # Minimum age (in turns) before an R3 block is promoted to R2.
+    PROMOTION_AGE: int = 3
+    # Minimum size (tokens) — don't promote tiny blocks, the cache
+    # benefit is negligible and they clutter R2.
+    PROMOTION_MIN_TOKENS: int = 200
+
+    def _promote_stable_to_durable(self) -> None:
+        """Promote stable R3 blocks to R2.
+
+        Candidates: blocks that have been in R3 for at least PROMOTION_AGE
+        turns, are large enough to matter for cache, and are PRESENT
+        (not already evicted). Conversation blocks are excluded — they're
+        ephemeral by nature and will be stripped by Taste later.
+        """
+        r3 = self.projection.region(RegionID.EPHEMERAL)
+        r2 = self.projection.region(RegionID.DURABLE)
+        current_turn = self.projection.turn
+
+        promoted: list[ContentBlock] = []
+        remaining: list[ContentBlock] = []
+
+        for block in r3.blocks:
+            age = current_turn - block.access.created_turn
+            if (
+                block.status == ContentStatus.PRESENT
+                and block.kind in (ContentKind.TOOL_RESULT, ContentKind.FILE)
+                and block.size_tokens >= self.PROMOTION_MIN_TOKENS
+                and age >= self.PROMOTION_AGE
+            ):
+                promoted.append(block)
+            else:
+                remaining.append(block)
+
+        if not promoted:
+            return
+
+        r3.blocks = remaining
+        for block in promoted:
+            block.region = RegionID.DURABLE
+            r2.blocks.append(block)
+            self._emit(
+                EventKind.BLOCK_AGED,
+                handle=block.handle,
+                from_region="EPHEMERAL",
+                to_region="DURABLE",
+            )
+            log.info(
+                "promoted %s to R2: %s (%d tokens, age %d turns)",
+                block.handle[:8], block.label,
+                block.size_tokens, current_turn - block.access.created_turn,
+            )
+
     def _place_event(self, event: InboundEvent) -> ContentBlock:
         """Classify an event and place it in the right region."""
         region, kind = self._classify_event(event)

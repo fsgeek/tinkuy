@@ -18,12 +18,13 @@ def test_parse_client_system_converts_text_blocks_to_inbound_events():
         {"type": "text", "text": "# CLAUDE.md\nBe concise."},
     ]
 
-    events = _parse_client_system(client_system)
+    events, billing = _parse_client_system(client_system)
 
     assert len(events) == 2
     assert all(e.type == EventType.SYSTEM_UPDATE for e in events)
     assert events[0].content == "You are Claude, made by Anthropic."
     assert events[1].content == "# CLAUDE.md\nBe concise."
+    assert billing is None
 
 
 def test_parse_client_system_handles_bare_strings():
@@ -35,10 +36,11 @@ def test_parse_client_system_handles_bare_strings():
         {"type": "text", "text": "More instructions."},
     ]
 
-    events = _parse_client_system(client_system)
+    events, billing = _parse_client_system(client_system)
 
     assert len(events) == 2
     assert events[0].content == "You are Claude."
+    assert billing is None
 
 
 def test_parse_client_system_strips_cache_control():
@@ -50,12 +52,13 @@ def test_parse_client_system_strips_cache_control():
          "cache_control": {"type": "ephemeral"}},
     ]
 
-    events = _parse_client_system(client_system)
+    events, billing = _parse_client_system(client_system)
 
     assert len(events) == 1
     assert events[0].content == "instructions"
     # No cache_control in metadata
     assert "cache_control" not in events[0].metadata
+    assert billing is None
 
 
 def test_client_system_ingested_on_first_turn_populates_r1():
@@ -187,16 +190,23 @@ def test_payload_system_blocks_come_only_from_projection():
     assert r1.block_count >= 1
 
 
-def test_memory_protocol_is_in_r1_projection_not_injected():
-    """Memory protocol lives in the projection, not injected post-synthesis."""
+def test_memory_protocol_is_in_r2_projection_not_injected():
+    """Memory protocol lives in R2 (durable), not R1 or injected post-synthesis."""
     gw = Gateway(GatewayConfig(lightweight=False))
 
-    # Memory protocol should already be in R1
-    r1 = gw.projection.region(RegionID.SYSTEM)
-    r1_text = " ".join(b.content for b in r1.present_blocks())
+    # Memory protocol should be in R2 (not R1 — R1 must start with client content for cache)
+    r2 = gw.projection.region(RegionID.DURABLE)
+    r2_text = " ".join(b.content for b in r2.present_blocks())
 
-    assert "yuyay-memory-protocol" in r1_text, (
-        "Memory protocol not found in R1 projection"
+    assert "yuyay-memory-protocol" in r2_text, (
+        "Memory protocol not found in R2 projection"
+    )
+
+    # Verify it's NOT in R1
+    r1 = gw.projection.region(RegionID.SYSTEM)
+    r1_labels = [b.label for b in r1.present_blocks()]
+    assert "memory-protocol" not in r1_labels, (
+        "Memory protocol is in R1 — will bust cache prefix"
     )
 
 
@@ -207,8 +217,8 @@ def test_inject_memory_protocol_r1_method_does_not_exist():
     )
 
 
-def test_client_system_change_preserves_memory_protocol_in_r1():
-    """When client system blocks change, memory protocol survives."""
+def test_client_system_change_preserves_memory_protocol_in_r2():
+    """When client system blocks change, memory protocol survives in R2."""
     gw = Gateway(GatewayConfig(lightweight=False))
 
     body_v1 = {
@@ -228,10 +238,15 @@ def test_client_system_change_preserves_memory_protocol_in_r1():
     }
     gw.prepare_request(body_v2)
 
-    r1 = gw.projection.region(RegionID.SYSTEM)
-    r1_labels = [b.label for b in r1.present_blocks()]
+    # Memory protocol in R2, untouched by R1 clear
+    r2 = gw.projection.region(RegionID.DURABLE)
+    r2_labels = [b.label for b in r2.present_blocks()]
+    assert "memory-protocol" in r2_labels, "Memory protocol was lost"
 
-    assert "memory-protocol" in r1_labels, "Memory protocol was deleted during R1 clear"
+    # R1 has only client system content
+    r1 = gw.projection.region(RegionID.SYSTEM)
     r1_text = " ".join(b.content for b in r1.present_blocks())
     assert "Version 2" in r1_text, "New client system content missing"
     assert "Version 1" not in r1_text, "Old client system content not cleared"
+    r1_labels = [b.label for b in r1.present_blocks()]
+    assert "memory-protocol" not in r1_labels, "Memory protocol leaked into R1"

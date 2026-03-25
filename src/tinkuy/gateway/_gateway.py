@@ -221,14 +221,17 @@ class Gateway:
         self._tool_call_hashes: set[str] = set()
         self._thrash_count: int = 0  # for telemetry
         self._client_system_fingerprint: str | None = None
+        self._billing_header_block: dict[str, Any] | None = None
 
-        # Memory protocol is stable forever — it belongs in R1.
+        # Memory protocol is durable gateway content — it belongs in R2.
+        # NOT R1: R1 must start with client system content so Anthropic's
+        # cache prefix matches. Putting our content first busts the cache.
         if not self.config.lightweight:
             self.orchestrator.projection.add_content(
                 content=MEMORY_PROTOCOL,
                 kind=ContentKind.SYSTEM,
                 label="memory-protocol",
-                region=RegionID.SYSTEM,
+                region=RegionID.DURABLE,
             )
 
         self._pending_turn_context: dict[str, Any] | None = None
@@ -248,15 +251,25 @@ class Gateway:
         system blocks change. This is the anti-proxy boundary — client
         system content enters the projection, never the payload.
         """
-        # Fingerprint: hash of full content (not just lengths — content
-        # can change at the same length, e.g. updated CLAUDE.md)
+        # Fingerprint: hash of content EXCLUDING the billing header.
+        # The billing header's cch= hash rotates every turn — including
+        # it would defeat fingerprint dedup entirely.
         hasher = hashlib.sha256()
         for block in client_system:
             if isinstance(block, str):
-                hasher.update(block.encode())
+                text = block
             elif isinstance(block, dict):
-                hasher.update(block.get("text", "").encode())
+                text = block.get("text", "")
+            else:
+                continue
+            if text.lstrip().startswith(_BILLING_HEADER_PREFIX):
+                continue  # Exclude from fingerprint
+            hasher.update(text.encode())
         fingerprint = hasher.hexdigest()[:16]
+
+        # Always extract the billing header — it rotates every turn
+        # but must be passed through as a standalone block.
+        self._billing_header_block = _extract_billing_header(client_system)
 
         if fingerprint == self._client_system_fingerprint:
             return  # Unchanged — skip re-ingestion
@@ -271,13 +284,14 @@ class Gateway:
 
         # Parse into events and route through the orchestrator's
         # existing SYSTEM_UPDATE → R1 placement path.
-        events = _parse_client_system(client_system)
+        # Billing header was already extracted above — parse the rest.
+        events, _ = _parse_client_system(client_system)
         for event in events:
             self.orchestrator._place_event(event)
 
         log.info(
-            "ingested %d client system blocks into R1 (fingerprint=%s)",
-            len(events), fingerprint,
+            "ingested %d client system blocks into R1 (fingerprint=%s, billing_header=%s)",
+            len(events), fingerprint, self._billing_header_block is not None,
         )
 
     def _setup_stores(self) -> None:
@@ -366,18 +380,22 @@ class Gateway:
         gw._gemini_live = GeminiLiveAdapter(gw.orchestrator)
         gw._gemini_response = GeminiResponseIngester(gw.orchestrator)
 
-        # Ensure memory protocol is in R1 (may be missing from old checkpoints).
+        # Ensure memory protocol is in R2 (may be in R1 from old checkpoints).
         if not gw.config.lightweight:
+            # Migrate: remove from R1 if present in old checkpoint
             r1 = gw.orchestrator.projection.region(RegionID.SYSTEM)
+            r1.blocks = [b for b in r1.blocks if b.label != "memory-protocol"]
+
+            r2 = gw.orchestrator.projection.region(RegionID.DURABLE)
             has_protocol = any(
-                b.label == "memory-protocol" for b in r1.blocks
+                b.label == "memory-protocol" for b in r2.blocks
             )
             if not has_protocol:
                 gw.orchestrator.projection.add_content(
                     content=MEMORY_PROTOCOL,
                     kind=ContentKind.SYSTEM,
                     label="memory-protocol",
-                    region=RegionID.SYSTEM,
+                    region=RegionID.DURABLE,
                 )
 
         return gw
@@ -654,7 +672,14 @@ class Gateway:
             if k not in ("messages", "system")
         }
         upstream["messages"] = turn_result.api_payload.get("messages", [])
-        upstream["system"] = turn_result.api_payload.get("system", [])
+
+        # Billing header goes first as a standalone block — Anthropic
+        # strips it for cache-key computation when it arrives as its own
+        # block. No cache_control: it must not participate in caching.
+        system_blocks = list(turn_result.api_payload.get("system", []))
+        if self._billing_header_block:
+            system_blocks.insert(0, self._billing_header_block)
+        upstream["system"] = system_blocks
 
         # Capture wire metadata
         self._pending_turn_context["wire"] = {
@@ -1203,16 +1228,50 @@ def _construct_message(msg: dict[str, Any]) -> dict[str, Any]:
     return {"role": msg["role"], "content": constructed}
 
 
+_BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
+
+
+def _extract_billing_header(
+    client_system: list[dict[str, Any] | str],
+) -> dict[str, Any] | None:
+    """Extract the billing header block from client system blocks.
+
+    Returns it as a standalone system block (no cache_control), or None
+    if not found. Called every turn because the cch= hash rotates.
+    """
+    for block in client_system:
+        if isinstance(block, str):
+            text = block
+        elif isinstance(block, dict):
+            text = block.get("text", "")
+        else:
+            continue
+        if text.lstrip().startswith(_BILLING_HEADER_PREFIX):
+            return {"type": "text", "text": text}
+    return None
+
+
 def _parse_client_system(
     client_system: list[dict[str, Any] | str],
-) -> list[InboundEvent]:
+) -> tuple[list[InboundEvent], dict[str, Any] | None]:
     """Parse client system blocks into InboundEvents for projection ingestion.
 
     All client system blocks become SYSTEM_UPDATE events placed in R1.
     cache_control is stripped — the gateway owns cache placement.
     This is the ingestion side of the anti-proxy boundary.
+
+    The billing header (x-anthropic-billing-header:...) is detected and
+    returned separately. It MUST NOT enter the projection — its cch= hash
+    rotates every turn, which would bust the entire R1 cache prefix.
+    Anthropic strips it for cache-key computation when it arrives as a
+    standalone system block, so we pass it through as-is.
+
+    Returns:
+        (events, billing_header_block | None)
     """
     events: list[InboundEvent] = []
+    billing_header: dict[str, Any] | None = None
+
     for i, block in enumerate(client_system):
         if isinstance(block, str):
             text = block
@@ -1222,12 +1281,19 @@ def _parse_client_system(
             continue
         if not text:
             continue
+
+        # Billing header: identity passthrough, never enters projection
+        if text.lstrip().startswith(_BILLING_HEADER_PREFIX):
+            billing_header = {"type": "text", "text": text}
+            log.debug("billing header detected, excluded from projection")
+            continue
+
         events.append(InboundEvent(
             type=EventType.SYSTEM_UPDATE,
             content=text,
             label=f"client-system-{i}",
         ))
-    return events
+    return events, billing_header
 
 
 def _extract_tool_calls(

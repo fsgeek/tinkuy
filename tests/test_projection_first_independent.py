@@ -21,8 +21,8 @@ def _r1_contents(gateway: Gateway) -> list[str]:
 
 
 def test_parse_client_system_empty_inputs_produce_no_events():
-    assert _parse_client_system([]) == []
-    assert _parse_client_system(["", {"type": "text", "text": ""}, 123]) == []
+    assert _parse_client_system([]) == ([], None)
+    assert _parse_client_system(["", {"type": "text", "text": ""}, 123]) == ([], None)
 
 
 def test_parse_client_system_mixed_types_keeps_only_textual_content():
@@ -34,8 +34,9 @@ def test_parse_client_system_mixed_types_keeps_only_textual_content():
         {"text": "gamma"},
     ]
 
-    events = _parse_client_system(blocks)
+    events, billing = _parse_client_system(blocks)
 
+    assert billing is None
     assert [e.type for e in events] == [EventType.SYSTEM_UPDATE] * 3
     assert [e.label for e in events] == ["client-system-0", "client-system-1", "client-system-4"]
     assert [e.content for e in events] == ["alpha", "beta", "gamma"]
@@ -43,7 +44,7 @@ def test_parse_client_system_mixed_types_keeps_only_textual_content():
 
 def test_parse_client_system_preserves_large_blocks():
     big = "X" * 120_000
-    events = _parse_client_system([{"type": "text", "text": big}])
+    events, _ = _parse_client_system([{"type": "text", "text": big}])
 
     assert len(events) == 1
     assert events[0].type == EventType.SYSTEM_UPDATE
@@ -94,14 +95,19 @@ def test_ingest_client_system_clears_stale_client_blocks_and_preserves_memory_pr
     gw._ingest_client_system([{"type": "text", "text": "sys-v2-only"}])
 
     r1 = gw.projection.region(RegionID.SYSTEM).blocks
-    labels = [b.label for b in r1]
-    contents = [b.content for b in r1]
+    r1_labels = [b.label for b in r1]
+    r1_contents = [b.content for b in r1]
 
-    assert labels.count("memory-protocol") == 1
-    assert "sys-v2-only" in contents
-    assert "sys-v1-a" not in contents
-    assert "sys-v1-b" not in contents
-    assert labels.count("client-system-0") == 1
+    # Memory protocol is in R2 now, not R1
+    assert "memory-protocol" not in r1_labels
+    assert "sys-v2-only" in r1_contents
+    assert "sys-v1-a" not in r1_contents
+    assert "sys-v1-b" not in r1_contents
+    assert r1_labels.count("client-system-0") == 1
+
+    # Memory protocol safe in R2
+    r2_labels = [b.label for b in gw.projection.region(RegionID.DURABLE).blocks]
+    assert r2_labels.count("memory-protocol") == 1
 
 
 def test_structural_impediment_client_system_removed_from_public_and_internal_signatures():
@@ -145,9 +151,14 @@ def test_prepare_request_populates_r1_and_system_is_projection_driven():
     )
 
     r1_contents = _r1_contents(gw)
-    assert any(c == MEMORY_PROTOCOL for c in r1_contents)
+    # Memory protocol is in R2, not R1
+    assert MEMORY_PROTOCOL not in r1_contents
     assert "Independent policy A" in r1_contents
     assert "Independent policy B" in r1_contents
+
+    # Memory protocol in R2
+    r2_contents = [b.content for b in gw.projection.region(RegionID.DURABLE).blocks]
+    assert any(c == MEMORY_PROTOCOL for c in r2_contents)
 
     system = upstream["system"]
     assert isinstance(system, list)
@@ -196,6 +207,14 @@ def test_prepare_request_proxy_escape_hatch_is_dead_no_raw_client_system_blocks(
     assert "ignored" not in joined
 
 
+def _r2_labels(gateway: Gateway) -> list[str]:
+    return [b.label for b in gateway.projection.region(RegionID.DURABLE).blocks]
+
+
+def _r2_contents(gateway: Gateway) -> list[str]:
+    return [b.content for b in gateway.projection.region(RegionID.DURABLE).blocks]
+
+
 def test_resume_keeps_single_memory_protocol_from_fresh_checkpoint(tmp_path):
     config = GatewayConfig(data_dir=str(tmp_path), session_id="fresh", lightweight=False)
     gw = Gateway(config)
@@ -204,8 +223,9 @@ def test_resume_keeps_single_memory_protocol_from_fresh_checkpoint(tmp_path):
     resumed = Gateway.resume(config)
 
     assert resumed is not None
-    labels = _r1_labels(resumed)
-    assert labels.count("memory-protocol") == 1
+    # Memory protocol in R2, not R1
+    assert "memory-protocol" not in _r1_labels(resumed)
+    assert _r2_labels(resumed).count("memory-protocol") == 1
 
 
 def test_resume_injects_memory_protocol_into_legacy_checkpoint(tmp_path):
@@ -218,17 +238,20 @@ def test_resume_injects_memory_protocol_into_legacy_checkpoint(tmp_path):
     )
 
     assert resumed is not None
-    labels = _r1_labels(resumed)
-    contents = _r1_contents(resumed)
+    # Memory protocol in R2
+    labels = _r2_labels(resumed)
+    contents = _r2_contents(resumed)
     assert labels.count("memory-protocol") == 1
     assert MEMORY_PROTOCOL in contents
+    # Not in R1
+    assert "memory-protocol" not in _r1_labels(resumed)
 
 
 def test_parse_client_system_events_route_to_r1_via_orchestrator_place_event():
     projection = Projection()
     orch = Orchestrator(projection=projection)
 
-    events = _parse_client_system(["route-me", {"type": "text", "text": "and-me"}])
+    events, _ = _parse_client_system(["route-me", {"type": "text", "text": "and-me"}])
     placed = [orch._place_event(event) for event in events]
 
     assert all(isinstance(event, InboundEvent) for event in events)
