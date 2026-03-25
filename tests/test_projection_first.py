@@ -205,3 +205,33 @@ def test_inject_memory_protocol_r1_method_does_not_exist():
     assert not hasattr(Gateway, "_inject_memory_protocol_r1"), (
         "_inject_memory_protocol_r1 still exists — payload mutation backdoor"
     )
+
+
+def test_client_system_change_preserves_memory_protocol_in_r1():
+    """When client system blocks change, memory protocol survives."""
+    gw = Gateway(GatewayConfig(lightweight=False))
+
+    body_v1 = {
+        "system": [{"type": "text", "text": "Version 1"}],
+        "messages": [{"role": "user", "content": "hello"}],
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 8096,
+    }
+    gw.prepare_request(body_v1)
+    gw.ingest_response("ack")
+
+    body_v2 = {
+        "system": [{"type": "text", "text": "Version 2"}],
+        "messages": [{"role": "user", "content": "hi"}],
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 8096,
+    }
+    gw.prepare_request(body_v2)
+
+    r1 = gw.projection.region(RegionID.SYSTEM)
+    r1_labels = [b.label for b in r1.present_blocks()]
+
+    assert "memory-protocol" in r1_labels, "Memory protocol was deleted during R1 clear"
+    r1_text = " ".join(b.content for b in r1.present_blocks())
+    assert "Version 2" in r1_text, "New client system content missing"
+    assert "Version 1" not in r1_text, "Old client system content not cleared"

@@ -9,7 +9,7 @@ from tinkuy.formats.gemini import (
     GeminiLiveAdapter,
     GeminiResponseIngester,
 )
-from tinkuy.gateway import Gateway
+from tinkuy.gateway import Gateway, GatewayConfig
 from tinkuy.orchestrator import (
     EventType,
     InboundEvent,
@@ -237,7 +237,7 @@ def test_gemini_response_ingester_returns_none_without_candidates():
 
 
 def test_gateway_prepare_gemini_request_synthesizes_payload():
-    gateway = Gateway()
+    gateway = Gateway(GatewayConfig(lightweight=True))
 
     # Both formats work on the same gateway — format is per-request,
     # not gateway state.
