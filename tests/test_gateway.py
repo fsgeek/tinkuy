@@ -218,3 +218,123 @@ def test_ingest_response_raises_on_unknown_signal_type():
             content="assistant",
             signals=[{"type": "unsupported", "handle": "abcd1234"}],
         )
+
+
+
+def test_prepare_request_returns_system_blocks_array():
+    gw = Gateway()
+    client_body = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 16000,
+        "stream": True,
+        "system": [
+            {"type": "text", "text": "You are helpful.", "cache_control": {"type": "ephemeral"}},
+        ],
+        "messages": [
+            {"role": "user", "content": "Hello"},
+        ],
+    }
+
+    upstream = gw.prepare_request(client_body)
+
+    assert isinstance(upstream.get("system"), list)
+    assert upstream["system"]
+    assert all(isinstance(block, dict) for block in upstream["system"])
+    assert all("type" in block and "text" in block for block in upstream["system"])
+
+
+
+def test_prepare_request_places_client_system_first():
+    gw = Gateway()
+    client_body = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 16000,
+        "stream": True,
+        "system": [
+            {"type": "text", "text": "Client block 1"},
+            {"type": "text", "text": "Client block 2"},
+        ],
+        "messages": [
+            {"role": "user", "content": "Hello"},
+        ],
+    }
+
+    upstream = gw.prepare_request(client_body)
+
+    system = upstream["system"]
+    assert len(system) >= 2
+    assert system[0]["text"] == "Client block 1"
+    assert system[1]["text"] == "Client block 2"
+
+
+
+def test_prepare_request_strips_client_cache_control():
+    gw = Gateway()
+    client_body = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 16000,
+        "stream": True,
+        "system": [
+            {"type": "text", "text": "Client block 1", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "Client block 2", "cache_control": {"type": "persistent"}},
+        ],
+        "messages": [
+            {"role": "user", "content": "Hello"},
+        ],
+    }
+
+    upstream = gw.prepare_request(client_body)
+
+    # Client's own cache_control values must not survive — no "persistent" TTL
+    for block in upstream["system"]:
+        cc = block.get("cache_control", {})
+        assert cc.get("type") != "persistent", (
+            "Client cache_control leaked through — gateway is cache authority"
+        )
+
+    # Gateway places its own breakpoints at tier boundaries
+    has_breakpoint = any("cache_control" in b for b in upstream["system"])
+    assert has_breakpoint, "Gateway must place at least one cache breakpoint"
+
+
+
+def test_prepare_request_single_user_message():
+    gw = Gateway()
+    client_body = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 16000,
+        "stream": True,
+        "system": [
+            {"type": "text", "text": "You are helpful."},
+        ],
+        "messages": [
+            {"role": "assistant", "content": "Previous answer"},
+            {"role": "user", "content": "Current user turn"},
+        ],
+    }
+
+    upstream = gw.prepare_request(client_body)
+
+    assert upstream["messages"] == [{"role": "user", "content": "Current user turn"}]
+
+
+
+def test_prepare_request_preserves_model_and_stream():
+    gw = Gateway()
+    client_body = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 16000,
+        "stream": True,
+        "system": [
+            {"type": "text", "text": "You are helpful."},
+        ],
+        "messages": [
+            {"role": "user", "content": "Hello"},
+        ],
+    }
+
+    upstream = gw.prepare_request(client_body)
+
+    assert upstream["model"] == client_body["model"]
+    assert upstream["max_tokens"] == client_body["max_tokens"]
+    assert upstream["stream"] is client_body["stream"]

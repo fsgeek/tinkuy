@@ -92,24 +92,10 @@ def create_app(
     # Per-session gateways, keyed by session ID or a default
     gateways: dict[str, Gateway] = {}
 
-    def _extract_cch(system: Any) -> str | None:
-        """Extract cch= value from billing header in system prompt.
-
-        Claude Code embeds 'x-anthropic-billing-header: ... cch=XXXXX;'
-        in a system prompt block. The cch hash identifies the session
-        configuration — different for parent vs subagent.
-        """
-        if not system:
-            return None
-        parts = system if isinstance(system, list) else [system]
-        for part in parts:
-            text = part.get("text", "") if isinstance(part, dict) else str(part)
-            if "cch=" in text:
-                import re
-                m = re.search(r"cch=([a-f0-9]+)", text)
-                if m:
-                    return m.group(1)
-        return None
+    # System prompt fingerprints for subagent detection.
+    # The parent's fingerprint is recorded on first request.
+    # Any request with a different fingerprint is a subagent.
+    parent_fingerprints: dict[str, str] = {}  # session_id -> fingerprint
 
     def _extract_session_id(
         header_value: Optional[str],
@@ -139,13 +125,8 @@ def create_app(
     def get_gateway(session_id: Optional[str]) -> Gateway:
         key = session_id or "__default__"
         if key not in gateways:
-            # Subagent detection: session keys with ":" are subagents
-            # (session_id:cch). They get lightweight mode — no page table,
-            # no memory protocol injection. Tinkuy still tracks telemetry
-            # but doesn't add context overhead. This prevents the thrashing
-            # pattern where the page table (median 5k tokens, up to 19k)
-            # consumes context that the subagent needs for file reads.
-            is_subagent = ":" in (key or "")
+            # Only parent sessions reach here — subagents are caught
+            # earlier and get pure passthrough (no Gateway at all).
             cfg = GatewayConfig(
                 context_limit=config.context_limit,
                 data_dir=config.data_dir,
@@ -153,25 +134,42 @@ def create_app(
                 enable_console=config.enable_console,
                 enable_event_log=config.enable_event_log,
                 tensor_store=config.tensor_store,
-                lightweight=is_subagent,
             )
-            if is_subagent:
-                log.info("subagent session %s — lightweight mode", key)
             gw = Gateway.resume(cfg)
             if gw is None:
                 gw = Gateway(cfg)
             gateways[key] = gw
         return gateways[key]
 
+    # Wire log: full request bodies for every outbound API call.
+    # Written to {data_dir}/wire.jsonl — one JSON line per request.
+    _wire_log_path: Path | None = None
+    if config.data_dir:
+        _wire_log_path = Path(config.data_dir) / "wire.jsonl"
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         async def log_request(request: httpx.Request):
+            content_len = len(request.content) if request.content else 0
             log.info(
                 "  WIRE -> %s %s (%d bytes)",
-                request.method,
-                request.url,
-                len(request.content) if request.content else 0,
+                request.method, request.url, content_len,
             )
+            # Write full request body to wire log.
+            if _wire_log_path and request.content:
+                import time as _time
+                record = {
+                    "ts": _time.time(),
+                    "method": str(request.method),
+                    "url": str(request.url),
+                    "body_bytes": content_len,
+                    "body": json.loads(request.content)
+                        if request.headers.get("content-type", "").startswith("application/json")
+                           or request.content[:1] == b"{"
+                        else request.content.decode("utf-8", errors="replace"),
+                }
+                with open(_wire_log_path, "a") as f:
+                    f.write(json.dumps(record, default=str) + "\n")
 
         event_hooks = {"request": [log_request]}
         timeout = httpx.Timeout(300.0, connect=10.0)
@@ -231,20 +229,110 @@ def create_app(
 
         body = await request.json()
         is_streaming = body.get("stream", False)
+
+        # --- Inbound request logging (research data) ---
+        # Full body to wire log; summary to gateway log.
+        metadata = body.get("metadata", {})
+        system_blocks = body.get("system", [])
+        system_summary = []
+        if isinstance(system_blocks, list):
+            for sb in system_blocks:
+                if isinstance(sb, dict):
+                    system_summary.append({
+                        "type": sb.get("type", "?"),
+                        "cache_control": sb.get("cache_control"),
+                        "text_len": len(sb.get("text", "")),
+                    })
+        log.info(
+            "  inbound | metadata=%s system_blocks=%d system_summary=%s",
+            json.dumps(metadata, default=str),
+            len(system_blocks) if isinstance(system_blocks, list) else 1,
+            json.dumps(system_summary),
+        )
+        if _wire_log_path:
+            import time as _time
+            record = {
+                "ts": _time.time(),
+                "direction": "inbound",
+                "body": body,
+            }
+            with open(_wire_log_path, "a") as f:
+                f.write(json.dumps(record, default=str) + "\n")
+
         session_id = _extract_session_id(
             request.headers.get("x-tinkuy-session"), body
         )
-        # Subagent isolation: Claude Code embeds a cch= hash in the
-        # billing header that identifies the session configuration.
-        # Subagents (scourers, agent tools) have a different cch than
-        # the parent. Route them to their own gateway instance so they
-        # get proper context management without corrupting the parent.
-        request_cch = _extract_cch(body.get("system"))
-        if request_cch and session_id:
-            session_key = f"{session_id}:{request_cch}"
-        else:
-            session_key = session_id
-        gw = get_gateway(session_key)
+
+        # --- Subagent detection ---
+        # Claude Code sends the SAME session_id for parent and agents.
+        # We detect agents by system prompt fingerprint: the parent's
+        # system prompt structure is recorded on first request. Any
+        # request with a different structure is a subagent.
+        # We fingerprint block count + per-block text lengths, which
+        # is stable across turns but differs between parent (~27k in
+        # 4 blocks) and agents (~3.9k in 3 blocks).
+        import hashlib as _hashlib
+        sys_blocks = body.get("system", [])
+        if not isinstance(sys_blocks, list):
+            sys_blocks = [sys_blocks] if sys_blocks else []
+        structure = [
+            len(sb.get("text", "")) if isinstance(sb, dict) else len(str(sb))
+            for sb in sys_blocks
+        ]
+        sys_fingerprint = _hashlib.sha256(
+            json.dumps(structure).encode()
+        ).hexdigest()[:12]
+
+        key = session_id or "__default__"
+        if key not in parent_fingerprints:
+            # First request for this session — assume it's the parent.
+            parent_fingerprints[key] = sys_fingerprint
+            log.info(
+                "parent fingerprint recorded | session=%s fp=%s "
+                "blocks=%d sizes=%s",
+                session_id, sys_fingerprint, len(structure), structure,
+            )
+
+        is_subagent = sys_fingerprint != parent_fingerprints[key]
+        if is_subagent:
+            log.info("subagent passthrough | session=%s", session_id)
+            headers = _forward_headers(request)
+            client: httpx.AsyncClient = request.app.state.anthropic_client
+            if is_streaming:
+                headers["content-type"] = "application/json"
+                upstream_req = client.build_request(
+                    "POST", "/v1/messages",
+                    content=json.dumps(body).encode("utf-8"),
+                    headers=headers,
+                )
+                upstream_resp = await client.send(upstream_req, stream=True)
+                if upstream_resp.status_code >= 400:
+                    return await _handle_error(
+                        upstream_resp, body, json.dumps(body).encode("utf-8")
+                    )
+                resp_headers = _strip_encoding_headers(upstream_resp)
+                async def _passthrough_stream():
+                    async for chunk in upstream_resp.aiter_bytes():
+                        yield chunk
+                    await upstream_resp.aclose()
+                return StreamingResponse(
+                    _passthrough_stream(),
+                    status_code=upstream_resp.status_code,
+                    headers=resp_headers,
+                    media_type="text/event-stream",
+                )
+            else:
+                upstream_resp = await client.post(
+                    "/v1/messages", json=body, headers=headers,
+                )
+                return Response(
+                    content=upstream_resp.content,
+                    status_code=upstream_resp.status_code,
+                    media_type="application/json",
+                )
+
+        # Use the session_id directly for the parent session gateway.
+        gw = get_gateway(session_id)
 
         # Defense in depth: if max_tokens=1 and non-streaming, this is
         # a token-counting probe (Claude Code fallback when count_tokens

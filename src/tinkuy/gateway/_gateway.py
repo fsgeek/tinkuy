@@ -104,6 +104,7 @@ from tinkuy.core.store import (
     PageStore,
 )
 from tinkuy.formats.anthropic import LiveAdapter as AnthropicLiveAdapter
+from tinkuy.formats.system_blocks import SystemBlockSynthesizer
 from tinkuy.formats.gemini import (
     GeminiLiveAdapter,
     GeminiInboundAdapter,
@@ -202,17 +203,23 @@ class Gateway:
         self._setup_stores()
         self._setup_bus()
         self._setup_orchestrator()
-        
+
         # Adapters
         self._ingest = IngestAdapter(self.orchestrator)
         self._anthropic_live = AnthropicLiveAdapter(self.orchestrator)
-        
+        self._system_block = SystemBlockSynthesizer(self.orchestrator)
+
         self._gemini_live = GeminiLiveAdapter(self.orchestrator)
         self._gemini_inbound = GeminiInboundAdapter()
         self._gemini_response = GeminiResponseIngester(self.orchestrator)
         
         self.telemetry: list[TurnTelemetry] = []
         self._client_overhead_tokens: int | None = None
+
+        # Thrashing detection: hash of tool calls in the current burst.
+        # Cleared when a turn has no tool calls. Collision = thrashing.
+        self._tool_call_hashes: set[str] = set()
+        self._thrash_count: int = 0  # for telemetry
         self._pending_turn_context: dict[str, Any] | None = None
         self._telemetry_path: Path | None = None
         if self.config.data_dir and self.config.session_id:
@@ -303,6 +310,7 @@ class Gateway:
         # Rebuild all adapters — they hold a reference to the orchestrator
         gw._ingest = IngestAdapter(gw.orchestrator)
         gw._anthropic_live = AnthropicLiveAdapter(gw.orchestrator)
+        gw._system_block = SystemBlockSynthesizer(gw.orchestrator)
         gw._gemini_live = GeminiLiveAdapter(gw.orchestrator)
         gw._gemini_response = GeminiResponseIngester(gw.orchestrator)
         return gw
@@ -329,6 +337,7 @@ class Gateway:
         tool_results: list[dict[str, Any]] | None = None,
         events: list[InboundEvent] | None = None,
         format: APIFormat = APIFormat.ANTHROPIC,
+        client_system: list[dict[str, Any]] | None = None,
     ) -> TurnResult:
         """Process a single turn.
 
@@ -338,6 +347,9 @@ class Gateway:
         format is a per-request property: it determines which adapter
         synthesizes the outbound payload.  The projection itself is
         format-agnostic.
+
+        client_system: The client's original system blocks, passed
+            through to the synthesizer for placement in the system array.
         """
         inbound = events or []
 
@@ -367,8 +379,14 @@ class Gateway:
             record.eviction_decisions
         )
 
-        # Synthesize API payload — adapter chosen per-request
-        payload = self._synthesize(format)
+        # Synthesize API payload — adapter chosen per-request.
+        # For Anthropic, client_system and user_content are passed
+        # to the synthesizer so it can build the complete payload.
+        payload = self._synthesize(
+            format,
+            client_system=client_system,
+            user_content=user_content,
+        )
 
         pressure = self.orchestrator.scheduler.read_pressure(
             self.orchestrator.projection
@@ -381,20 +399,64 @@ class Gateway:
             pending_evictions=pending,
         )
 
-    def _synthesize(self, format: APIFormat) -> dict[str, Any]:
-        """Synthesize the outbound API payload for the given format."""
+    def _synthesize(
+        self,
+        format: APIFormat,
+        client_system: list[dict[str, Any]] | None = None,
+        user_content: str | None = None,
+    ) -> dict[str, Any]:
+        """Synthesize the outbound API payload for the given format.
+
+        For ANTHROPIC format, uses the system-block synthesizer which
+        puts the entire projection into system blocks ordered by
+        stability. The messages array contains only the current user turn.
+
+        client_system: The client's original system blocks (Claude Code
+            sends instructions, tools, CLAUDE.md, skills). These are
+            placed first in the system array — the gateway's projection
+            content comes after.
+        user_content: The current user message. Goes into the messages
+            array as the sole user message.
+        """
         if format == APIFormat.GEMINI:
             payload = self._gemini_live.synthesize_request()
             # TODO: Inject page table for Gemini format
             return payload
 
-        # Anthropic (default) — synthesize_messages handles page table
-        # placement internally, respecting tool_result ordering.
-        payload = self._anthropic_live.synthesize_messages(
+        # Anthropic — system-block synthesizer
+        payload = self._system_block.synthesize(
             skip_page_table=self.config.lightweight,
         )
+
+        # Place client system blocks first, gateway blocks after.
+        # The gateway is the cache authority — strip client cache_control.
+        if client_system:
+            cleaned = []
+            for block in client_system:
+                if isinstance(block, dict):
+                    clean = {k: v for k, v in block.items()
+                             if k != "cache_control"}
+                    cleaned.append(clean)
+                elif isinstance(block, str):
+                    cleaned.append({"type": "text", "text": block})
+            # Client blocks are R1 (stable forever from gateway's perspective).
+            # Place cache_control breakpoint on the last client block.
+            if cleaned:
+                cleaned[-1]["cache_control"] = {"type": "ephemeral"}
+            payload["system"] = cleaned + payload.get("system", [])
+
+        # Inject memory protocol into R1 tier AFTER client blocks are
+        # placed. This ensures the injection finds the client breakpoint
+        # (not the R3 breakpoint from the synthesizer), placing the
+        # protocol correctly in the R1 tier where it gets cached.
         if not self.config.lightweight:
-            self._inject_memory_protocol(payload)
+            self._inject_memory_protocol_r1(payload)
+
+        # Add the current user message to messages
+        if user_content:
+            payload["messages"] = [
+                {"role": "user", "content": user_content}
+            ]
 
         # Pre-flight validation — catch layout violations before the wire
         from tinkuy.formats.validate import validate_anthropic_payload
@@ -403,8 +465,6 @@ class Gateway:
             for err in validation.errors:
                 loc = f" at {err.location}" if err.location else ""
                 log.error("PREFLIGHT [%s]%s: %s", err.rule, loc, err.message)
-            # Log but don't block — we want to see what the API says too
-            # TODO: consider raising after confidence in the validator grows
 
         return payload
 
@@ -448,9 +508,39 @@ class Gateway:
                 "cold start: bootstrapping projection from %d client messages",
                 len(request_messages),
             )
-            self._bootstrap_from_client(request_messages, client_body)
+            self._bootstrap_from_client(request_messages)
 
         user_content, tool_results = _extract_user_content(request_messages)
+
+        # Thrashing detection: hash tool calls from the last assistant
+        # message and check for repeats within the current burst.
+        tool_calls = _extract_tool_calls(request_messages)
+        if tool_calls:
+            thrashing = []
+            for tc in tool_calls:
+                h = hashlib.sha256(
+                    json.dumps(tc, sort_keys=True).encode()
+                ).hexdigest()[:16]
+                if h in self._tool_call_hashes:
+                    thrashing.append(tc.get("name", "?"))
+                self._tool_call_hashes.add(h)
+            if thrashing:
+                self._thrash_count += len(thrashing)
+                log.warning(
+                    "THRASHING DETECTED: %d repeated tool call(s): %s "
+                    "(burst total: %d, session: %s)",
+                    len(thrashing), thrashing,
+                    self._thrash_count, self.config.session_id,
+                )
+        else:
+            # No tool calls this turn — end of burst, clear the set
+            if self._tool_call_hashes:
+                log.info(
+                    "tool burst ended: %d unique calls, %d thrash detections",
+                    len(self._tool_call_hashes), self._thrash_count,
+                )
+            self._tool_call_hashes.clear()
+            self._thrash_count = 0
 
         log.info(
             "← request (anthropic) | session=%s stream=%s "
@@ -467,40 +557,41 @@ class Gateway:
             client_body, request_messages,
         )
 
+        # Extract client system blocks — these go first in the system array.
+        # The synthesizer handles placement and cache_control.
+        client_system = client_body.get("system")
+        if isinstance(client_system, str):
+            client_system = [{"type": "text", "text": client_system}]
+        elif not isinstance(client_system, list):
+            client_system = None
+
         turn_result = self.process_turn(
             user_content=user_content or "",
             tool_results=tool_results,
             format=APIFormat.ANTHROPIC,
+            client_system=client_system,
         )
 
         # Snapshot gateway state after processing (projection is updated)
         self._pending_turn_context["projection"] = (
             self._snapshot_gateway_state()
         )
-        # Capture repair counts and page table cost from the synthesizer
-        self._pending_turn_context["repairs"] = (
-            self._anthropic_live.last_repair_counts
-        )
+        # Capture page table cost from the system-block synthesizer.
+        # No repair counts — system blocks don't need alternation repair.
+        self._pending_turn_context["repairs"] = {}
         self._pending_turn_context["projection"]["page_table_tokens"] = (
-            self._anthropic_live.last_page_table_tokens
+            self._system_block.last_page_table_tokens
         )
 
-        # Build complete upstream body
+        # Build complete upstream body.
+        # The synthesizer already placed client system blocks + gateway
+        # system blocks + messages. No merge needed.
         upstream: dict[str, Any] = {
             k: v for k, v in client_body.items()
             if k not in ("messages", "system")
         }
         upstream["messages"] = turn_result.api_payload.get("messages", [])
-
-        # Merge system prompts
-        gateway_system = turn_result.api_payload.get("system")
-        client_system = client_body.get("system")
-        if gateway_system is not None and client_system is not None:
-            upstream["system"] = _merge_system(client_system, gateway_system)
-        elif gateway_system is not None:
-            upstream["system"] = gateway_system
-        elif client_system is not None:
-            upstream["system"] = client_system
+        upstream["system"] = turn_result.api_payload.get("system", [])
 
         # Capture wire metadata
         self._pending_turn_context["wire"] = {
@@ -780,7 +871,6 @@ class Gateway:
     def _bootstrap_from_client(
         self,
         messages: list[dict[str, Any]],
-        client_body: dict[str, Any],
     ) -> None:
         """Bootstrap the projection from the client's conversation history.
 
@@ -793,22 +883,12 @@ class Gateway:
         """
         from tinkuy.core.orchestrator import EventType, InboundEvent
 
-        # Ingest system prompt if present
-        client_system = client_body.get("system")
-        if client_system:
-            system_text = client_system
-            if isinstance(client_system, list):
-                system_text = "\n".join(
-                    p.get("text", "") for p in client_system
-                    if isinstance(p, dict)
-                )
-            self.orchestrator.begin_turn([
-                InboundEvent(
-                    type=EventType.SYSTEM_UPDATE,
-                    content=system_text,
-                    label="client system prompt",
-                )
-            ])
+        # Do NOT ingest the client's system prompt into R1.
+        # The client resends its system prompt on every request, and
+        # the synthesizer handles combining client + gateway system parts.
+        # Storing it here would duplicate it: the concatenated R1 copy
+        # won't match the client's individual blocks, so dedup fails
+        # and the system prompt goes on the wire twice (~27k wasted).
 
         # Find the boundary: everything before the last user turn is history
         last_user_start = len(messages)
@@ -852,25 +932,63 @@ class Gateway:
                     label="assistant",
                 )
 
+        block_count = sum(
+            len(r.blocks) for r in self.orchestrator.projection.regions.values()
+        )
         log.info(
             "bootstrap complete: ingested %d history messages, "
-            "projection turn=%d tokens=%d",
+            "projection turn=%d tokens=%d blocks=%d",
             len(history),
             self.orchestrator.turn,
             self.orchestrator.projection.total_tokens,
+            block_count,
         )
 
-    def _inject_memory_protocol(self, payload: dict[str, Any]) -> None:
-        """Inject the cooperative memory protocol instructions."""
+        # Sanity check: bootstrap should project, not mirror.
+        # If we just created 20+ blocks, we're proxying — carrying
+        # the client's full history as individual blocks instead of
+        # composing it into a tensor. This costs ~160 tokens of
+        # message framing per block on every turn, forever.
+        # TODO: replace this warning with immediate composition
+        # once the composed tensor architecture is implemented.
+        if block_count > 20:
+            log.warning(
+                "PROXY DETECTED: bootstrap created %d blocks (%d tokens). "
+                "This should be composed into a single tensor. "
+                "Current wire cost: ~%dk framing overhead per turn.",
+                block_count,
+                self.orchestrator.projection.total_tokens,
+                block_count * 160 // 1000,
+            )
+
+    def _inject_memory_protocol_r1(self, payload: dict[str, Any]) -> None:
+        """Inject the memory protocol into R1 of the system-block stack.
+
+        The protocol is stable forever — it belongs in R1 where it gets
+        cached. We find the first block with cache_control (the R1
+        breakpoint) and insert the protocol before it, then move the
+        breakpoint to the protocol block.
+        """
         system = payload.get("system", [])
-        if isinstance(system, list):
-            system.append({
-                "type": "text",
-                "text": MEMORY_PROTOCOL,
-            })
-            payload["system"] = system
-        elif isinstance(system, str):
-            payload["system"] = system + "\n\n" + MEMORY_PROTOCOL
+        if not isinstance(system, list):
+            return
+
+        protocol_block = {"type": "text", "text": MEMORY_PROTOCOL}
+
+        # Find the R1 breakpoint (first block with cache_control).
+        # Insert the protocol before the breakpoint, then move
+        # cache_control to the protocol block (it's now the last R1 block).
+        for i, block in enumerate(system):
+            if "cache_control" in block:
+                # Insert protocol after this R1 block
+                system.insert(i + 1, protocol_block)
+                # Move breakpoint from the old last-R1 to the protocol
+                protocol_block["cache_control"] = block.pop("cache_control")
+                return
+
+        # No breakpoint found — just append with a breakpoint
+        protocol_block["cache_control"] = {"type": "ephemeral"}
+        system.append(protocol_block)
 
     def _parse_signal(self, data: dict[str, Any]) -> ResponseSignal:
         """Parse a cooperative memory signal from raw dict."""
@@ -912,6 +1030,31 @@ class Gateway:
 # --- Helpers ---
 
 
+def _extract_tool_calls(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Extract tool_use calls from the last assistant message.
+
+    Returns a list of {name, input} dicts — the identity of each call.
+    Used for thrashing detection: if the same name+input appears twice
+    in a tool-calling burst, the model is re-issuing lost reads.
+    """
+    calls: list[dict[str, Any]] = []
+    for msg in reversed(messages):
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content", [])
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    calls.append({
+                        "name": block.get("name", ""),
+                        "input": block.get("input", {}),
+                    })
+        break  # only look at the last assistant message
+    return calls
+
+
 def _extract_user_content(
     messages: list[dict[str, Any]],
 ) -> tuple[str, list[dict[str, Any]] | None]:
@@ -948,52 +1091,6 @@ def _extract_user_content(
 
     return "\n".join(user_parts), tool_results or None
 
-
-def _merge_system(
-    client_system: Any,
-    gateway_system: Any,
-) -> Any:
-    """Merge client's system prompt with gateway additions.
-
-    The gateway is the cache authority. It places cache_control
-    breakpoints on stable content boundaries. The merge preserves
-    these breakpoints — stripping them would destroy cache hit rate.
-
-    Order: client parts first (stable across turns in practice),
-    then gateway parts (R0/R1 stable, page table volatile).
-    """
-    if isinstance(client_system, str):
-        client_parts = [{"type": "text", "text": client_system}]
-    elif isinstance(client_system, list):
-        client_parts = list(client_system)
-    else:
-        client_parts = []
-
-    if isinstance(gateway_system, str):
-        gw_parts = [{"type": "text", "text": gateway_system}]
-    elif isinstance(gateway_system, list):
-        gw_parts = list(gateway_system)
-    else:
-        gw_parts = []
-
-    # Deduplicate — don't repeat content the client already sent
-    client_texts = {p.get("text", "") for p in client_parts
-                    if isinstance(p, dict)}
-    new_parts = [p for p in gw_parts
-                 if isinstance(p, dict) and p.get("text", "") not in client_texts]
-
-    merged = client_parts + new_parts
-
-    # Strip all cache_control from merged system parts.
-    # The synthesizer (_collect_system) is the sole cache authority
-    # for system blocks — it places exactly one breakpoint on the
-    # last gateway system block. Client system parts may carry stale
-    # cache_control from their own API interactions.
-    for part in merged:
-        if isinstance(part, dict):
-            part.pop("cache_control", None)
-
-    return merged
 
 
 def _extract_response_content_from_json(
