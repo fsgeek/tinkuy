@@ -185,3 +185,23 @@ def test_payload_system_blocks_come_only_from_projection():
     # R1 in the projection should have the content
     r1 = gw.projection.region(RegionID.SYSTEM)
     assert r1.block_count >= 1
+
+
+def test_memory_protocol_is_in_r1_projection_not_injected():
+    """Memory protocol lives in the projection, not injected post-synthesis."""
+    gw = Gateway(GatewayConfig(lightweight=False))
+
+    # Memory protocol should already be in R1
+    r1 = gw.projection.region(RegionID.SYSTEM)
+    r1_text = " ".join(b.content for b in r1.present_blocks())
+
+    assert "yuyay-memory-protocol" in r1_text, (
+        "Memory protocol not found in R1 projection"
+    )
+
+
+def test_inject_memory_protocol_r1_method_does_not_exist():
+    """The post-synthesis injection method should be deleted."""
+    assert not hasattr(Gateway, "_inject_memory_protocol_r1"), (
+        "_inject_memory_protocol_r1 still exists — payload mutation backdoor"
+    )

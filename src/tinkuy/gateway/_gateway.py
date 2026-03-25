@@ -221,6 +221,16 @@ class Gateway:
         self._tool_call_hashes: set[str] = set()
         self._thrash_count: int = 0  # for telemetry
         self._client_system_fingerprint: str | None = None
+
+        # Memory protocol is stable forever — it belongs in R1.
+        if not self.config.lightweight:
+            self.orchestrator.projection.add_content(
+                content=MEMORY_PROTOCOL,
+                kind=ContentKind.SYSTEM,
+                label="memory-protocol",
+                region=RegionID.SYSTEM,
+            )
+
         self._pending_turn_context: dict[str, Any] | None = None
         self._telemetry_path: Path | None = None
         if self.config.data_dir and self.config.session_id:
@@ -355,6 +365,21 @@ class Gateway:
         gw._system_block = SystemBlockSynthesizer(gw.orchestrator)
         gw._gemini_live = GeminiLiveAdapter(gw.orchestrator)
         gw._gemini_response = GeminiResponseIngester(gw.orchestrator)
+
+        # Ensure memory protocol is in R1 (may be missing from old checkpoints).
+        if not gw.config.lightweight:
+            r1 = gw.orchestrator.projection.region(RegionID.SYSTEM)
+            has_protocol = any(
+                b.label == "memory-protocol" for b in r1.blocks
+            )
+            if not has_protocol:
+                gw.orchestrator.projection.add_content(
+                    content=MEMORY_PROTOCOL,
+                    kind=ContentKind.SYSTEM,
+                    label="memory-protocol",
+                    region=RegionID.SYSTEM,
+                )
+
         return gw
 
     def rehydrate(self, source: str | Path | dict[str, Any]) -> None:
@@ -473,11 +498,6 @@ class Gateway:
         payload = self._system_block.synthesize(
             skip_page_table=self.config.lightweight,
         )
-
-        # Inject memory protocol into R1 tier.
-        # TODO(task4): Move memory protocol into the projection.
-        if not self.config.lightweight:
-            self._inject_memory_protocol_r1(payload)
 
         # Messages: use pre-computed suffix if available, else wrap
         # user_content as a single user message (for non-prepare_request
@@ -1003,35 +1023,6 @@ class Gateway:
                 self.orchestrator.projection.total_tokens,
                 block_count * 160 // 1000,
             )
-
-    def _inject_memory_protocol_r1(self, payload: dict[str, Any]) -> None:
-        """Inject the memory protocol into R1 of the system-block stack.
-
-        The protocol is stable forever — it belongs in R1 where it gets
-        cached. We find the first block with cache_control (the R1
-        breakpoint) and insert the protocol before it, then move the
-        breakpoint to the protocol block.
-        """
-        system = payload.get("system", [])
-        if not isinstance(system, list):
-            return
-
-        protocol_block = {"type": "text", "text": MEMORY_PROTOCOL}
-
-        # Find the R1 breakpoint (first block with cache_control).
-        # Insert the protocol before the breakpoint, then move
-        # cache_control to the protocol block (it's now the last R1 block).
-        for i, block in enumerate(system):
-            if "cache_control" in block:
-                # Insert protocol after this R1 block
-                system.insert(i + 1, protocol_block)
-                # Move breakpoint from the old last-R1 to the protocol
-                protocol_block["cache_control"] = block.pop("cache_control")
-                return
-
-        # No breakpoint found — just append with a breakpoint
-        protocol_block["cache_control"] = {"type": "ephemeral"}
-        system.append(protocol_block)
 
     def _parse_signal(self, data: dict[str, Any]) -> ResponseSignal:
         """Parse a cooperative memory signal from raw dict."""
