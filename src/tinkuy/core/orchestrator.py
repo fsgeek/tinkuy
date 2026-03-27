@@ -935,17 +935,25 @@ class Orchestrator:
         and the block becomes faultable with a stub marker. Better
         to lose the tensor summary than deadlock the eviction pipeline.
 
+        Hard gate: blocks with live dependents are never force-evicted.
+        The dependency penalty in scoring makes nomination unlikely, but
+        under extreme pressure it can still happen. This gate prevents
+        breaking the coherence graph — a block that other blocks declared
+        as load-bearing cannot be removed without a tensor replacement.
+
         Returns the number of evictions executed.
         """
         count = 0
         pressure = self.scheduler.read_pressure(self.projection)
+        dep_counts = self.scheduler._build_dependent_counts(self.projection)
         for region in self.projection.regions.values():
             for block in list(region.blocks):
                 if block.status != ContentStatus.PENDING_REMOVAL:
                     continue
 
                 if block.tensor_handle is not None:
-                    # Normal path — tensor available
+                    # Normal path — tensor available, dependency survives
+                    # through the tensor handle.
                     block.status = ContentStatus.AVAILABLE
                     block.content = ""
                     self._emit(
@@ -960,6 +968,19 @@ class Orchestrator:
                         PressureZone.ELEVATED, PressureZone.CRITICAL,
                     )
                 ):
+                    # Hard gate: never force-evict a block with live
+                    # dependents. The dependency graph says this block is
+                    # load-bearing — destroying it without a tensor
+                    # replacement breaks downstream provenance chains.
+                    if dep_counts.get(block.handle, 0) > 0:
+                        log.info(
+                            "skipping force-eviction of %s — %d live "
+                            "dependents, awaiting tensor",
+                            block.handle[:8],
+                            dep_counts[block.handle],
+                        )
+                        continue
+
                     # Force-evict: stuck pending with no tensor and
                     # pressure is high. Persist content, evict with stub.
                     if block.content:

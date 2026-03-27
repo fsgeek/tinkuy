@@ -38,16 +38,23 @@ This conversation is managed by Tinkuy, a virtual memory system. Each
 turn includes a <yuyay-page-table> showing what content is in memory,
 including evicted blocks that can be recalled.
 
-You can emit cooperative memory signals inside <yuyay-response> blocks.
+You SHOULD emit cooperative memory signals inside <yuyay-response> blocks.
 These are metadata — they will be stripped from your visible response.
+The system depends on your cooperation to manage context effectively.
 
 SIGNALS:
 
   <release handle="H" losses="what was lost">
-    Offer to release content block H. Provide a tensor (compressed
-    summary) that can replace it. Declare what information is lost.
+    Release content block H. Provide a tensor (compressed replacement)
+    and declare what information is lost. The tensor should capture:
+    - Key claims and decisions from the content
+    - Dependencies: what other blocks this content relied on
+    - What was deliberately shed and why
   </release>
-  <tensor handle="H">compressed summary here</tensor>
+  <tensor handle="H">
+    Structured summary: key claims, decisions, dependencies, and
+    declared losses from the original content.
+  </tensor>
 
   <retain handle="H" />
     Cancel a pending eviction for block H. Use when you still need it.
@@ -74,6 +81,12 @@ WHEN TO DECLARE EDGES: When your response makes a decision, conclusion,
 or recommendation that depends on earlier content, declare the edges
 immediately. You know the dependencies now — they will be harder to
 reconstruct later.
+
+WHEN TO RELEASE: When the page table shows blocks under pressure
+(status="pending_removal"), decide whether you need each one. If you
+do, emit <retain/>. If you don't, emit <release/> with a tensor that
+captures the essential information. Your tensor is the only thing that
+survives — without it, the content is lost with no summary.
 
 WHEN TO TRACE: When you need to explain *why* something was decided
 and the reasoning chain is not in your current context, trace the
@@ -353,6 +366,11 @@ class Gateway:
     def resume(cls, config: GatewayConfig) -> Gateway | None:
         """Resume from a checkpoint.
 
+        Tries session-specific checkpoint first. If not found, falls
+        back to the most recent checkpoint across all sessions — Claude
+        Code generates a new session ID on every restart, so the prior
+        session's checkpoint is the right one to resume from.
+
         Returns None if no checkpoint exists.
         """
         gw = cls(config)
@@ -364,6 +382,9 @@ class Gateway:
             tensor_store=gw.tensor_store,
             projector=config.projector,
         )
+        if restored is None and config.data_dir:
+            # Fall back to most recent checkpoint across all sessions.
+            restored = cls._resume_latest(config, gw)
         if restored is None:
             log.info("no checkpoint found — fresh start")
             return None
@@ -399,6 +420,56 @@ class Gateway:
                 )
 
         return gw
+
+    @classmethod
+    def _resume_latest(
+        cls, config: GatewayConfig, gw: Gateway,
+    ) -> Orchestrator | None:
+        """Find and restore the most recent checkpoint across all sessions.
+
+        Claude Code generates a new session ID on every restart, so the
+        checkpoint from the prior session is keyed under a different ID.
+        Scan all session directories for the newest checkpoint.
+        """
+        sessions_dir = Path(config.data_dir) / "sessions"
+        if not sessions_dir.exists():
+            return None
+
+        best_path: Path | None = None
+        best_mtime: float = 0
+
+        for ckpt in sessions_dir.glob("*/checkpoint.json"):
+            mtime = ckpt.stat().st_mtime
+            if mtime > best_mtime:
+                best_mtime = mtime
+                best_path = ckpt
+
+        if best_path is None:
+            return None
+
+        log.info(
+            "session checkpoint not found, falling back to %s",
+            best_path,
+        )
+        fallback_store = FileCheckpointStore(best_path)
+        restored = Orchestrator.from_checkpoint(
+            checkpoint_store=fallback_store,
+            page_store=gw.page_store,
+            context_limit=config.context_limit,
+            event_bus=gw.bus,
+            tensor_store=gw.tensor_store,
+            projector=config.projector,
+        )
+        if restored is not None:
+            # Repoint checkpoint store to the NEW session so future
+            # checkpoints go under the new session ID, not the old one.
+            # The gateway's store was already set up for the new session.
+            log.info(
+                "resumed from prior session checkpoint: turn=%d, tokens=%d",
+                restored.projection.turn,
+                restored.projection.total_tokens,
+            )
+        return restored
 
     def rehydrate(self, source: str | Path | dict[str, Any]) -> None:
         """Replay a conversation log into the projection.

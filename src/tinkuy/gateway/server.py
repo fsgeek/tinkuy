@@ -26,6 +26,7 @@ from typing import Any, Optional
 
 from tinkuy.gateway._gateway import Gateway, GatewayConfig, TurnTelemetry
 from tinkuy.gateway.stream import BlockType, StreamBuffer
+from tinkuy.taste_gateway import TasteGateway, TasteGatewayConfig
 
 log = logging.getLogger("tinkuy.server")
 
@@ -66,6 +67,7 @@ def create_app(
     gateway_config: GatewayConfig | None = None,
     upstream: str | None = None,
     gemini_upstream: str | None = None,
+    taste: bool = False,
 ) -> Any:
     """Create the FastAPI application.
 
@@ -89,13 +91,18 @@ def create_app(
 
     config = gateway_config or GatewayConfig(enable_console=True)
 
+    # Taste mode: one TasteGateway handles all sessions internally
+    taste_gw: TasteGateway | None = None
+    if taste:
+        taste_gw = TasteGateway(TasteGatewayConfig(
+            data_dir=config.data_dir,
+            enable_console=True,
+            context_limit=config.context_limit,
+        ))
+
     # Per-session gateways, keyed by session ID or a default
     gateways: dict[str, Gateway] = {}
 
-    # System prompt fingerprints for subagent detection.
-    # The parent's fingerprint is recorded on first request.
-    # Any request with a different fingerprint is a subagent.
-    parent_fingerprints: dict[str, str] = {}  # session_id -> fingerprint
 
     def _extract_session_id(
         header_value: Optional[str],
@@ -122,11 +129,14 @@ def create_app(
                     pass
         return None
 
-    def get_gateway(session_id: Optional[str]) -> Gateway:
+    def get_gateway(
+        session_id: Optional[str],
+        lightweight: bool = False,
+    ) -> Gateway:
         key = session_id or "__default__"
+        if lightweight:
+            key = f"{key}:lightweight"
         if key not in gateways:
-            # Only parent sessions reach here — subagents are caught
-            # earlier and get pure passthrough (no Gateway at all).
             cfg = GatewayConfig(
                 context_limit=config.context_limit,
                 data_dir=config.data_dir,
@@ -134,9 +144,13 @@ def create_app(
                 enable_console=config.enable_console,
                 enable_event_log=config.enable_event_log,
                 tensor_store=config.tensor_store,
+                lightweight=lightweight,
             )
-            gw = Gateway.resume(cfg)
-            if gw is None:
+            if not lightweight:
+                gw = Gateway.resume(cfg)
+                if gw is None:
+                    gw = Gateway(cfg)
+            else:
                 gw = Gateway(cfg)
             gateways[key] = gw
         return gateways[key]
@@ -193,6 +207,16 @@ def create_app(
         lifespan=lifespan,
     )
 
+    @app.head("/")
+    @app.get("/")
+    async def root(request: Request) -> Response:
+        """Health check — Claude Code sends HEAD / before each session."""
+        return Response(
+            content=json.dumps({"status": "ok", "service": "tinkuy"}),
+            status_code=200,
+            media_type="application/json",
+        )
+
     @app.exception_handler(404)
     async def not_found_handler(request: Request, exc: Any):
         log.warning(
@@ -207,15 +231,45 @@ def create_app(
 
     @app.post("/v1/messages/count_tokens")
     async def count_tokens(request: Request) -> Response:
-        """Pure passthrough — the gateway never touches token counting."""
+        """Count tokens against the gateway's view, not the client's.
+
+        The client's message array may be much larger (no eviction)
+        or much smaller (no tensor injection) than what actually goes
+        to the API. Counting against the raw client body lies about
+        context usage. Transform first, then count.
+        """
         body = await request.json()
         headers = _forward_headers(request)
+
+        if taste_gw is not None:
+            # Taste mode: inject tensor into system blocks, same as
+            # a real request. Don't increment cycle — this is a probe.
+            # We use prepare_request but roll back the cycle after.
+            session_id = _extract_session_id(
+                request.headers.get("x-tinkuy-session"), body
+            )
+            transformed, session, _ = taste_gw.prepare_request(
+                body, session_id=session_id,
+            )
+            session.cycle -= 1  # undo the cycle increment
+            count_body = {
+                k: v for k, v in transformed.items()
+                if k != "stream"
+            }
+        else:
+            # Standard mode: transform through the gateway
+            session_id = _extract_session_id(
+                request.headers.get("x-tinkuy-session"), body
+            )
+            gw = get_gateway(session_id, lightweight=True)
+            count_body = gw.prepare_request(body)
+
         upstream_resp = await request.app.state.anthropic_client.post(
             "/v1/messages/count_tokens",
-            json=body,
+            json=count_body,
             headers=headers,
         )
-        log.info("count_tokens | status=%d", upstream_resp.status_code)
+        log.info("count_tokens | status=%d (gateway-transformed)", upstream_resp.status_code)
         return Response(
             content=upstream_resp.content,
             status_code=upstream_resp.status_code,
@@ -263,97 +317,24 @@ def create_app(
             request.headers.get("x-tinkuy-session"), body
         )
 
-        # --- Subagent detection ---
-        # Claude Code sends the SAME session_id for parent and agents.
-        # We detect agents by system prompt fingerprint: the parent's
-        # system prompt structure is recorded on first request. Any
-        # request with a different structure is a subagent.
-        # We fingerprint block count + per-block text lengths, which
-        # is stable across turns but differs between parent (~27k in
-        # 4 blocks) and agents (~3.9k in 3 blocks).
-        import hashlib as _hashlib
-        sys_blocks = body.get("system", [])
-        if not isinstance(sys_blocks, list):
-            sys_blocks = [sys_blocks] if sys_blocks else []
-        structure = [
-            len(sb.get("text", "")) if isinstance(sb, dict) else len(str(sb))
-            for sb in sys_blocks
-        ]
-        sys_fingerprint = _hashlib.sha256(
-            json.dumps(structure).encode()
-        ).hexdigest()[:12]
+        # Forward auth headers — we never touch credentials
+        headers = _forward_headers(request)
+        client: httpx.AsyncClient = request.app.state.anthropic_client
 
-        key = session_id or "__default__"
-        if key not in parent_fingerprints:
-            # First request for this session — assume it's the parent.
-            parent_fingerprints[key] = sys_fingerprint
-            log.info(
-                "parent fingerprint recorded | session=%s fp=%s "
-                "blocks=%d sizes=%s",
-                session_id, sys_fingerprint, len(structure), structure,
+        # --- Taste mode: tensor in the wire ---
+        if taste_gw is not None:
+            return await _handle_taste_message(
+                taste_gw, body, session_id, headers, client,
+                is_streaming, _wire_log_path,
             )
 
-        is_subagent = sys_fingerprint != parent_fingerprints[key]
-        if is_subagent:
-            log.info("subagent passthrough | session=%s", session_id)
-            headers = _forward_headers(request)
-            client: httpx.AsyncClient = request.app.state.anthropic_client
-            if is_streaming:
-                headers["content-type"] = "application/json"
-                upstream_req = client.build_request(
-                    "POST", "/v1/messages",
-                    content=json.dumps(body).encode("utf-8"),
-                    headers=headers,
-                )
-                upstream_resp = await client.send(upstream_req, stream=True)
-                if upstream_resp.status_code >= 400:
-                    return await _handle_error(
-                        upstream_resp, body, json.dumps(body).encode("utf-8")
-                    )
-                resp_headers = _strip_encoding_headers(upstream_resp)
-                async def _passthrough_stream():
-                    async for chunk in upstream_resp.aiter_bytes():
-                        yield chunk
-                    await upstream_resp.aclose()
-                return StreamingResponse(
-                    _passthrough_stream(),
-                    status_code=upstream_resp.status_code,
-                    headers=resp_headers,
-                    media_type="text/event-stream",
-                )
-            else:
-                upstream_resp = await client.post(
-                    "/v1/messages", json=body, headers=headers,
-                )
-                return Response(
-                    content=upstream_resp.content,
-                    status_code=upstream_resp.status_code,
-                    media_type="application/json",
-                )
-
-        # Use the session_id directly for the parent session gateway.
+        # --- Standard gateway mode ---
+        # Every request goes through the gateway. No proxy path.
+        # No exceptions. No "just this one case." No passthrough.
         gw = get_gateway(session_id)
-
-        # Defense in depth: if max_tokens=1 and non-streaming, this is
-        # a token-counting probe (Claude Code fallback when count_tokens
-        # 404s). Pass it through without touching the projection.
-        if not is_streaming and body.get("max_tokens") == 1:
-            log.warning("token-counting probe detected — passthrough without projection")
-            headers = _forward_headers(request)
-            upstream_resp = await request.app.state.anthropic_client.post(
-                "/v1/messages", json=body, headers=headers,
-            )
-            return Response(
-                content=upstream_resp.content,
-                status_code=upstream_resp.status_code,
-                media_type="application/json",
-            )
 
         # Gateway owns the transformation — one call, no branching
         upstream_body = gw.prepare_request(body)
-
-        # Forward auth headers — we never touch credentials
-        headers = _forward_headers(request)
 
         # Stash request headers in pending telemetry context
         if gw._pending_turn_context is not None:
@@ -370,8 +351,6 @@ def create_app(
             headers.get("anthropic-version", "MISSING"),
             headers.get("anthropic-beta", "MISSING"),
         )
-
-        client: httpx.AsyncClient = request.app.state.anthropic_client
 
         if is_streaming:
             upstream_bytes = json.dumps(upstream_body).encode("utf-8")
@@ -469,6 +448,22 @@ def create_app(
                 headers=resp_headers,
                 media_type="application/json",
             )
+
+    @app.get("/v1/tinkuy/taste/status")
+    async def taste_status(request: Request) -> dict[str, Any]:
+        """Taste gateway status — tensor state for all sessions."""
+        if taste_gw is None:
+            return {"error": "taste mode not enabled"}
+        sessions = {}
+        for sid, s in taste_gw._sessions.items():
+            sessions[sid] = {
+                "cycle": s.cycle,
+                "n_strands": len(s.tensor.get("strands", [])) if s.tensor else 0,
+                "n_tensions": len(s.tensor.get("unresolved_tensions", [])) if s.tensor else 0,
+                "tensor_tokens": s.tensor_token_estimate(),
+                "cumulative_losses": len(s.loss_history),
+            }
+        return {"mode": "taste", "sessions": sessions}
 
     @app.post("/v1beta/models/{model_id}:streamGenerateContent")
     async def gemini_stream(model_id: str, request: Request) -> Response:
@@ -590,6 +585,328 @@ def create_app(
         return {"status": "ok", "service": "tinkuy"}
 
     return app
+
+
+# --- Taste gateway handler ---
+
+
+class _TasteStreamHandler:
+    """StreamHandler for taste mode: injects session tag, strips tensor.
+
+    Two responsibilities:
+    1. Prepend <tinkuy-session id="..."/> to the first text delta
+       (for session identity propagation through conversation echo)
+    2. Strip <yuyay-tensor> blocks from text deltas
+       (so tensor XML doesn't echo back through conversation history)
+
+    The reconstructor sees the full unmodified text (it runs before
+    handlers). The client sees: session tag + clean response text.
+    """
+
+    def __init__(self, session_tag: str | None = None) -> None:
+        self._session_tag = session_tag  # None = don't inject
+        self._tag_injected = False
+        self._suppressing = False
+        self._accumulated = ""
+
+    def on_event(self, event: Any) -> Any:
+        from tinkuy.gateway.stream import SSEEvent, SSEEventType
+
+        if event.type == SSEEventType.CONTENT_BLOCK_START:
+            self._accumulated = ""
+            self._suppressing = False
+            return event
+
+        if event.type != SSEEventType.CONTENT_BLOCK_DELTA:
+            return event
+
+        delta = event.data.get("delta", {})
+        delta_type = delta.get("type", "")
+
+        if delta_type != "text_delta":
+            return event
+
+        if self._suppressing:
+            return None
+
+        text = delta.get("text", "")
+
+        # Inject session tag into the first text delta
+        if self._session_tag and not self._tag_injected:
+            text = f"{self._session_tag}\n\n{text}"
+            self._tag_injected = True
+            new_data = dict(event.data)
+            new_delta = dict(delta)
+            new_delta["text"] = text
+            new_data["delta"] = new_delta
+            event = SSEEvent(
+                type=event.type,
+                data=new_data,
+                raw_line=event.raw_line,
+            )
+            # Fall through to tensor detection with modified event
+
+        self._accumulated += text
+
+        # Check for tensor start tag
+        tag_start = self._accumulated.find("<yuyay-tensor")
+        if tag_start >= 0:
+            self._suppressing = True
+            prior_len = len(self._accumulated) - len(text)
+            keep_chars = tag_start - prior_len
+            if keep_chars > 0:
+                new_data = dict(event.data)
+                new_delta = dict(event.data.get("delta", {}))
+                new_delta["text"] = text[:keep_chars]
+                new_data["delta"] = new_delta
+                return SSEEvent(
+                    type=event.type,
+                    data=new_data,
+                    raw_line=event.raw_line,
+                )
+            else:
+                return None
+
+        return event
+
+    def on_complete(self, message: Any) -> None:
+        pass
+
+
+async def _handle_taste_message(
+    taste_gw: TasteGateway,
+    body: dict[str, Any],
+    session_id: str | None,
+    headers: dict[str, str],
+    client: Any,  # httpx.AsyncClient
+    is_streaming: bool,
+    wire_log_path: Path | None,
+) -> Any:
+    """Handle a /v1/messages request through the taste gateway.
+
+    Streaming: stream chunks to client AND accumulate via StreamBuffer.
+    After stream completes, reconstruct full text, process through
+    TasteGateway for state tracking + logging. The client sees the
+    tensor XML at the end of the response — that's research data.
+
+    Non-streaming: full round-trip, process response, return.
+    """
+    from starlette.responses import Response, StreamingResponse
+
+    # 1. Transform request — inject tensor into system prompt
+    # Do NOT pass metadata session_id for session lookup. Session identity
+    # comes from the <tinkuy-session/> tag in conversation history, which
+    # is per-conversation-thread. The metadata session_id is shared across
+    # mainline and agents — using it would cause session collisions.
+    upstream_body, session, feedback = taste_gw.prepare_request(body)
+
+    _log_message_structure(upstream_body)
+    log.info(
+        "  taste | session=%s cycle=%d metadata_sid=%s | "
+        "headers version=%s beta=%s",
+        session.session_id, session.cycle,
+        session_id or "none",
+        headers.get("anthropic-version", "MISSING"),
+        headers.get("anthropic-beta", "MISSING"),
+    )
+
+    # Wire log — full transformed request for replay
+    if wire_log_path:
+        record = {
+            "ts": time.time(),
+            "direction": "taste_outbound",
+            "session_id": session.session_id,
+            "cycle": session.cycle,
+            "body": upstream_body,
+        }
+        with open(wire_log_path, "a") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+
+    if is_streaming:
+        upstream_bytes = json.dumps(upstream_body).encode("utf-8")
+        headers["content-type"] = "application/json"
+        upstream_req = client.build_request(
+            "POST", "/v1/messages",
+            content=upstream_bytes, headers=headers,
+        )
+        t_start = time.monotonic()
+        upstream_resp = await client.send(upstream_req, stream=True)
+
+        log.info(
+            "  taste -> upstream | status=%d (stream)",
+            upstream_resp.status_code,
+        )
+
+        if upstream_resp.status_code >= 400:
+            return await _handle_error(
+                upstream_resp, upstream_body, upstream_bytes,
+            )
+
+        # Inject session tag if this is a new session
+        from tinkuy.taste_gateway.tensor_protocol import make_session_tag
+        tag = (
+            make_session_tag(session.session_id)
+            if not session.tag_injected else None
+        )
+        handler = _TasteStreamHandler(session_tag=tag)
+        buffer = StreamBuffer(handlers=[handler])
+        t_first_byte: float | None = None
+
+        async def taste_stream_and_collect():
+            nonlocal t_first_byte
+            async for chunk in upstream_resp.aiter_bytes():
+                if t_first_byte is None:
+                    t_first_byte = time.monotonic()
+                # Stream through to client AND accumulate
+                for out_chunk in buffer.feed(chunk):
+                    yield out_chunk
+            await upstream_resp.aclose()
+
+            t_end = time.monotonic()
+
+            # Reconstruct full message and process through taste gateway
+            if buffer.complete:
+                message = buffer.finish()
+                text, content_blocks = _extract_response_content(message)
+                usage = message.usage
+
+                timing = {
+                    "ttfb": (
+                        (t_first_byte - t_start) if t_first_byte else None
+                    ),
+                    "duration": t_end - t_start,
+                    "request_bytes": len(upstream_bytes),
+                }
+
+                # Mark session tag as injected if handler did it
+                if handler._tag_injected:
+                    session.tag_injected = True
+
+                # Process through taste gateway — state tracking + logging
+                taste_gw.process_response(
+                    response_text=text,
+                    session=session,
+                    content_blocks=content_blocks,
+                    usage=usage,
+                    request_body=upstream_body,
+                    timing=timing,
+                    feedback=feedback,
+                )
+
+                # Also log telemetry summary to console
+                telemetry = _build_telemetry(
+                    message,
+                    request_bytes=len(upstream_bytes),
+                    ttfb=timing["ttfb"],
+                    duration=timing["duration"],
+                )
+                _log_request_summary_from_telemetry(telemetry)
+
+        resp_headers = _strip_encoding_headers(upstream_resp)
+        return StreamingResponse(
+            taste_stream_and_collect(),
+            status_code=upstream_resp.status_code,
+            headers=resp_headers,
+            media_type="text/event-stream",
+        )
+    else:
+        # Non-streaming — full round-trip
+        t_start = time.monotonic()
+        upstream_resp = await client.post(
+            "/v1/messages",
+            json=upstream_body,
+            headers=headers,
+        )
+        t_end = time.monotonic()
+
+        log.info(
+            "  taste -> upstream | status=%d",
+            upstream_resp.status_code,
+        )
+
+        if upstream_resp.status_code >= 400:
+            log.error(
+                "x upstream error | status=%d body=%s",
+                upstream_resp.status_code,
+                upstream_resp.text,
+            )
+            _dump_rejected_payload(upstream_body, upstream_resp.status_code)
+            resp_headers = _strip_encoding_headers(upstream_resp)
+            return Response(
+                content=upstream_resp.content,
+                status_code=upstream_resp.status_code,
+                headers=resp_headers,
+            )
+
+        try:
+            resp_data = upstream_resp.json()
+        except Exception:
+            log.error(
+                "x non-streaming response not valid JSON | "
+                "status=%d content-type=%s body=%r",
+                upstream_resp.status_code,
+                upstream_resp.headers.get("content-type", "?"),
+                upstream_resp.text[:500] if upstream_resp.text else "(empty)",
+            )
+            resp_headers = _strip_encoding_headers(upstream_resp)
+            return Response(
+                content=upstream_resp.content or b'{"error": "empty upstream response"}',
+                status_code=502,
+                headers=resp_headers,
+            )
+        usage = resp_data.get("usage")
+
+        # Extract text from response
+        text_parts = []
+        content_blocks = []
+        for block in resp_data.get("content", []):
+            if isinstance(block, dict):
+                if block.get("type") == "text":
+                    text_parts.append(block.get("text", ""))
+                content_blocks.append(block)
+        response_text = "\n".join(text_parts)
+
+        timing = {
+            "duration": t_end - t_start,
+        }
+
+        # Process through taste gateway — strips tensor, tracks state
+        clean_text = taste_gw.process_response(
+            response_text=response_text,
+            session=session,
+            content_blocks=content_blocks,
+            usage=usage,
+            request_body=upstream_body,
+            timing=timing,
+            feedback=feedback,
+        )
+
+        # Replace text in response with clean version (tensor stripped)
+        cleaned_content = []
+        clean_idx = 0
+        for block in resp_data.get("content", []):
+            if isinstance(block, dict) and block.get("type") == "text":
+                if clean_idx == 0:
+                    cleaned_content.append({
+                        **block,
+                        "text": clean_text,
+                    })
+                    clean_idx += 1
+                # Skip additional text blocks — clean_text has everything
+            else:
+                cleaned_content.append(block)
+        resp_data["content"] = cleaned_content
+
+        telemetry = _build_telemetry_from_json(resp_data)
+        _log_request_summary_from_telemetry(telemetry)
+
+        resp_headers = _strip_encoding_headers(upstream_resp)
+        return Response(
+            content=json.dumps(resp_data),
+            status_code=upstream_resp.status_code,
+            headers=resp_headers,
+            media_type="application/json",
+        )
 
 
 # --- HTTP helpers (wire-level only, no message content) ---
@@ -817,6 +1134,7 @@ def serve(
     gemini_upstream: str | None = None,
     data_dir: str | None = None,
     context_limit: int = 200_000,
+    taste: bool = False,
 ) -> None:
     """Start the tinkuy gateway server.
 
@@ -869,13 +1187,15 @@ def serve(
         gateway_config=config,
         upstream=upstream,
         gemini_upstream=gemini_upstream,
+        taste=taste,
     )
 
     anthropic_url = _resolve_upstream("anthropic", upstream)
     gemini_url = _resolve_upstream("gemini", gemini_upstream)
     base_url = f"http://127.0.0.1:{port}"
 
-    print(f"\n  tinkuy gateway listening on {base_url}", file=sys.stderr)
+    mode_label = "TASTE" if taste else "standard"
+    print(f"\n  tinkuy gateway [{mode_label}] listening on {base_url}", file=sys.stderr)
     print(f"  anthropic upstream: {anthropic_url}", file=sys.stderr)
     print(f"  gemini upstream:    {gemini_url}", file=sys.stderr)
     print(f"\n  export ANTHROPIC_BASE_URL={base_url}", file=sys.stderr)

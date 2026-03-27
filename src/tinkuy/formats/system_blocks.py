@@ -28,6 +28,7 @@ from typing import Any
 
 from tinkuy.core.adapter import coalesce_episodes
 from tinkuy.core.orchestrator import Orchestrator
+from tinkuy.core.pressure import PressureZone
 from tinkuy.core.regions import (
     ContentBlock,
     ContentKind,
@@ -279,6 +280,64 @@ class SystemBlockSynthesizer:
                     attrs += f' edges="{o["edges"]}"'
                 lines.append(f'    <outcome {attrs}/>')
             lines.append("  </signal-feedback>")
+
+        # Pressure advisory — tell the model about pressure state so it
+        # can cooperate. At MODERATE, blocks are being nominated but not
+        # yet force-evicted — this is the model's window to produce tensors.
+        # At ELEVATED/CRITICAL, force-eviction is imminent.
+        pressure = self.orchestrator.scheduler.read_pressure(
+            self.orchestrator.projection
+        )
+        pending = [
+            e for e in entries
+            if e["status"] == "pending_removal"
+        ]
+        if pressure.zone in (
+            PressureZone.MODERATE,
+            PressureZone.ELEVATED,
+            PressureZone.CRITICAL,
+        ) or pending:
+            urgency = {
+                PressureZone.MODERATE: "approaching limits",
+                PressureZone.ELEVATED: "high — force-eviction imminent",
+                PressureZone.CRITICAL: "critical — force-evicting now",
+            }.get(pressure.zone, "")
+
+            lines.append(
+                f'  <pressure zone="{pressure.zone.name}" '
+                f'usage="{pressure.usage:.0%}" '
+                f'pending="{len(pending)}">'
+            )
+            if pending:
+                if pressure.zone in (
+                    PressureZone.ELEVATED, PressureZone.CRITICAL,
+                ):
+                    lines.append(
+                        f"    URGENT ({urgency}): The following blocks will be "
+                        "force-evicted WITHOUT summary if you do not act now. "
+                        "For each one, emit <release/> with a <tensor/> or "
+                        "<retain/> if still needed."
+                    )
+                else:
+                    lines.append(
+                        f"    Context pressure is {urgency}. The following "
+                        "blocks are scheduled for eviction. Emit <release/> "
+                        "with a <tensor/> for blocks you can summarize, or "
+                        "<retain/> for blocks you still need."
+                    )
+                for p in pending:
+                    lines.append(
+                        f'    <pending handle="{p["handle"]}" '
+                        f'label="{p["label"]}" '
+                        f'size_tokens="{p["size_tokens"]}" '
+                        f'age_turns="{p["age_turns"]}"/>'
+                    )
+            elif urgency:
+                lines.append(
+                    f"    Context pressure is {urgency}. Consider releasing "
+                    "blocks you no longer need to free space."
+                )
+            lines.append("  </pressure>")
 
         lines.append("</yuyay-page-table>")
         return "\n".join(lines)

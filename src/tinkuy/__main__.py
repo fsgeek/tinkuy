@@ -40,6 +40,10 @@ def main() -> None:
         "--context-limit", type=int, default=200_000,
         help="Context window token limit (default: 200000)",
     )
+    serve_p.add_argument(
+        "--taste", action="store_true",
+        help="Use taste-native gateway (model self-curates via tensor)",
+    )
 
     args = parser.parse_args()
 
@@ -51,6 +55,7 @@ def main() -> None:
             gemini_upstream=args.gemini_upstream,
             data_dir=args.data_dir,
             context_limit=args.context_limit,
+            taste=args.taste,
         )
     else:
         parser.print_help()
