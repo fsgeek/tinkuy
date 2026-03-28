@@ -2,14 +2,15 @@
 
 No orchestrator. No eviction pipeline. No page table. No cooperative
 signals. The tensor is the memory. The model is the curator. This
-gateway injects the tensor into the system prompt, parses updates from
-the response, and carries the tensor forward. Everything else passes
-through.
+gateway injects the tensor into the system prompt, injects the
+_tinkuy_state_update tool, and intercepts the model's state update
+tool call. Everything else passes through.
 
 The gateway does NOT proxy. Every request is transformed. The
-transformation is: inject tensor protocol + current tensor state into
-the system prompt. The response transformation is: parse tensor update,
-strip it from visible response, carry forward.
+transformation is: inject state protocol + current state as JSON +
+state update tool into the request. The response transformation is:
+intercept state update tool_use, apply the structured update, carry
+forward.
 """
 
 from __future__ import annotations
@@ -23,11 +24,13 @@ from pathlib import Path
 from typing import Any
 
 from tinkuy.taste_gateway.tensor_protocol import (
+    TOOL_NAME,
+    build_harness_feedback,
     build_tensor_system_block,
     extract_session_tag,
+    get_state_update_tool,
     make_session_tag,
-    parse_memory_signals,
-    parse_tensor_update,
+    parse_state_update,
 )
 
 log = logging.getLogger("tinkuy.taste_gateway")
@@ -363,7 +366,7 @@ def _build_memory_objects(
 
 
 def _render_memory_block(session: "TasteSession") -> str:
-    """Render memory objects as labeled XML for the system prompt.
+    """Render memory objects as labeled markup for the system prompt.
 
     Each object is individually addressable by its id. The model sees
     the tool name, semantic label, size, source turn, and state.
@@ -550,7 +553,8 @@ class MemoryObject:
     """A labeled memory object — one tool exchange (use + result).
 
     The model sees these as labeled blocks in the system prompt and can
-    curate them via <yuyay-memory> signals: summarize, release, pin.
+    curate them via memory_actions in _tinkuy_state_update: summarize,
+    release, pin.
     """
     id: str                     # monotonic: m1, m2, m3, ...
     tool: str                   # tool name (Read, Bash, Glob, etc.)
@@ -601,6 +605,9 @@ class TasteSession:
     log_path: Path | None = None
     memory_objects: list[MemoryObject] = field(default_factory=list)
     _memory_seq: int = 0  # next sequence number for memory IDs
+    # Pending state update tool_use from prior cycle — used to inject
+    # the synthetic tool_result exchange on the next request.
+    pending_state_tool_use: dict | None = None
 
     def tensor_token_estimate(self) -> int:
         if self.tensor is None:
@@ -788,7 +795,8 @@ class TasteGateway:
         if not is_tool_cycle:
             session.cycle += 1
 
-        # Generate feedback only on human turns
+        # Generate feedback only on human turns. Feedback goes into the
+        # synthetic tool_result, not the system prompt.
         feedback: list[str] = []
         if not is_tool_cycle:
             feedback = _generate_feedback(
@@ -799,9 +807,10 @@ class TasteGateway:
                 memory_objects=session.memory_objects,
             )
 
-        # Build tensor system block — read-only during tool cycles
+        # Build state system block — read-only during tool cycles.
+        # Feedback goes via tool_result, not system prompt.
         tensor_block = build_tensor_system_block(
-            session.tensor, session.cycle, feedback=feedback,
+            session.tensor, session.cycle,
             tool_cycle=is_tool_cycle,
         )
 
@@ -838,6 +847,42 @@ class TasteGateway:
         # Prior conversation is in the tensor. Prior tool outputs become
         # labeled memory objects in a system block. Current turn in messages.
         our_messages = _build_taste_messages(messages, session, session.cycle)
+
+        # Inject synthetic tool_result exchange from prior cycle's state
+        # update. The API requires every tool_use to get a tool_result.
+        # We store the tool_use on the session in process_response, then
+        # prepend the exchange here so the model sees its feedback.
+        if session.pending_state_tool_use is not None and not is_tool_cycle:
+            tool_use_id = session.pending_state_tool_use["id"]
+            tool_input = session.pending_state_tool_use["input"]
+            feedback_payload = build_harness_feedback(
+                session.cycle, feedback, session.memory_objects,
+            )
+            synthetic_exchange = [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": tool_use_id,
+                            "name": TOOL_NAME,
+                            "input": tool_input,
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": json.dumps(feedback_payload),
+                        },
+                    ],
+                },
+            ]
+            our_messages = synthetic_exchange + our_messages
+            session.pending_state_tool_use = None
 
         # BP2: tensor block — small and stable (only changes at turn
         # boundaries). Placing it before memory objects means cache busts
@@ -907,6 +952,11 @@ class TasteGateway:
             if key in body:
                 transformed[key] = body[key]
 
+        # Inject _tinkuy_state_update into the tool list. The model
+        # calls this at turn boundaries to persist its state update.
+        client_tools = transformed.get("tools", [])
+        transformed["tools"] = list(client_tools) + [get_state_update_tool()]
+
         if self.config.enable_console:
             self._log_console(session, feedback)
 
@@ -923,18 +973,31 @@ class TasteGateway:
         request_body: dict | None = None,
         timing: dict | None = None,
         feedback: list[str] | None = None,
+        state_tool_use: dict | None = None,
     ) -> str:
-        """Process the model's response: extract tensor update, return clean text.
+        """Process the model's response: apply state update, return clean text.
 
-        The clean text (tensor stripped) is what the client sees. The
-        session tag is injected into the first response for a new session.
+        The state_tool_use dict (if any) is the intercepted
+        _tinkuy_state_update tool call, already extracted from the stream
+        by the server layer. It contains {id, input} — the tool_use_id
+        and the structured JSON input.
+
+        The session tag is injected into the first response for a new session.
         """
-        # Parse tensor update and memory signals from response
-        clean_text, raw_update = parse_tensor_update(response_text)
-        clean_text, memory_signals = parse_memory_signals(clean_text)
+        clean_text = response_text
 
-        # Apply memory curation signals
-        memory_events = self._apply_memory_signals(session, memory_signals)
+        # Extract state update from intercepted tool call
+        raw_update = None
+        if state_tool_use is not None:
+            raw_update = parse_state_update(state_tool_use["input"])
+            # Store for synthetic tool_result injection on next request
+            session.pending_state_tool_use = state_tool_use
+
+        # Apply memory actions from the state update
+        memory_actions = []
+        if raw_update is not None:
+            memory_actions = raw_update.pop("memory_actions", []) or []
+        memory_events = self._apply_memory_signals(session, memory_actions)
 
         # Capture prior tensor for logging
         prior_tensor = (

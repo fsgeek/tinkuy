@@ -591,101 +591,117 @@ def create_app(
 
 
 class _TasteStreamHandler:
-    """StreamHandler for taste mode: injects session tag, strips tensor.
+    """StreamHandler for taste mode: injects session tag, intercepts state tool.
 
-    Two responsibilities:
+    Three responsibilities:
     1. Prepend <tinkuy-session id="..."/> to the first text delta
        (for session identity propagation through conversation echo)
-    2. Strip <yuyay-tensor> blocks from text deltas
-       (so tensor XML doesn't echo back through conversation history)
+    2. Suppress _tinkuy_state_update tool_use content blocks from the
+       client-visible stream (intercept by content block type, not text)
+    3. Accumulate the state update tool input JSON for post-stream
+       processing
 
-    The reconstructor sees the full unmodified text (it runs before
-    handlers). The client sees: session tag + clean response text.
+    The reconstructor sees the full unmodified stream (it runs before
+    handlers). The client sees: session tag + clean response.
     """
 
     def __init__(self, session_tag: str | None = None) -> None:
         self._session_tag = session_tag  # None = don't inject
         self._tag_injected = False
-        self._suppressing = False
-        self._accumulated = ""
+        # State tool interception — track by content block index
+        self._suppressing_block: bool = False
+        self._state_tool_input_json: str = ""
+        self._state_tool_use_id: str = ""
+        self._current_block_index: int = -1
+        self._n_client_tool_uses: int = 0  # non-state tool_use count
+
+    @property
+    def state_tool_use(self) -> dict | None:
+        """Return the intercepted state update, or None."""
+        if not self._state_tool_input_json:
+            return None
+        try:
+            return {
+                "id": self._state_tool_use_id,
+                "input": json.loads(self._state_tool_input_json),
+            }
+        except json.JSONDecodeError:
+            log.warning("failed to parse state tool input JSON")
+            return None
 
     def on_event(self, event: Any) -> Any:
         from tinkuy.gateway.stream import SSEEvent, SSEEventType
+        from tinkuy.taste_gateway.tensor_protocol import TOOL_NAME
 
         if event.type == SSEEventType.CONTENT_BLOCK_START:
-            self._accumulated = ""
-            self._suppressing = False
+            self._current_block_index += 1
+            block = event.data.get("content_block", {})
+            if (block.get("type") == "tool_use"
+                    and block.get("name") == TOOL_NAME):
+                # This is our state update tool — suppress entirely
+                self._suppressing_block = True
+                self._state_tool_use_id = block.get("id", "")
+                self._state_tool_input_json = ""
+                return None
+            else:
+                self._suppressing_block = False
+                if block.get("type") == "tool_use":
+                    self._n_client_tool_uses += 1
+                return event
+
+        if event.type == SSEEventType.CONTENT_BLOCK_STOP:
+            if self._suppressing_block:
+                self._suppressing_block = False
+                return None
             return event
 
-        if event.type != SSEEventType.CONTENT_BLOCK_DELTA:
+        if event.type == SSEEventType.CONTENT_BLOCK_DELTA:
+            if self._suppressing_block:
+                # Accumulate the tool input JSON
+                delta = event.data.get("delta", {})
+                if delta.get("type") == "input_json_delta":
+                    self._state_tool_input_json += delta.get(
+                        "partial_json", "",
+                    )
+                return None
+
+            delta = event.data.get("delta", {})
+            if delta.get("type") == "text_delta":
+                text = delta.get("text", "")
+                # Inject session tag into the first text delta
+                if self._session_tag and not self._tag_injected:
+                    text = f"{self._session_tag}\n\n{text}"
+                    self._tag_injected = True
+                    new_data = dict(event.data)
+                    new_delta = dict(delta)
+                    new_delta["text"] = text
+                    new_data["delta"] = new_delta
+                    return SSEEvent(
+                        type=event.type,
+                        data=new_data,
+                        raw_line=event.raw_line,
+                    )
+
             return event
 
-        delta = event.data.get("delta", {})
-        delta_type = delta.get("type", "")
-
-        if delta_type != "text_delta":
-            return event
-
-        if self._suppressing:
-            return None
-
-        text = delta.get("text", "")
-
-        # Inject session tag into the first text delta
-        if self._session_tag and not self._tag_injected:
-            text = f"{self._session_tag}\n\n{text}"
-            self._tag_injected = True
-            new_data = dict(event.data)
-            new_delta = dict(delta)
-            new_delta["text"] = text
-            new_data["delta"] = new_delta
-            event = SSEEvent(
-                type=event.type,
-                data=new_data,
-                raw_line=event.raw_line,
-            )
-            # Fall through to tensor detection with modified event
-
-        self._accumulated += text
-
-        # Check for protocol output tags — these are invisible to client.
-        # Only suppress on real protocol output, not conversational mentions.
-        # Real tensor updates have 'updated-regions=' in the opening tag.
-        # Real memory signals have '<summarize', '<release', or '<pin' inside.
-        # A conversational mention like "the <yuyay-tensor> tag" won't match.
-        tag_start = -1
-        for marker in ["<yuyay-tensor ", "<yuyay-tensor\n"]:
-            pos = self._accumulated.find(marker)
-            if pos >= 0 and "updated-regions=" in self._accumulated[pos:pos+200]:
-                tag_start = pos
-                break
-        if tag_start < 0:
-            for marker in ["<yuyay-memory>"]:
-                pos = self._accumulated.find(marker)
-                if pos >= 0:
-                    # Check for actual signal content after the tag
-                    after = self._accumulated[pos:]
-                    if any(sig in after for sig in
-                           ["<summarize ", "<release ", "<pin "]):
-                        tag_start = pos
-                        break
-
-        if tag_start >= 0:
-            self._suppressing = True
-            prior_len = len(self._accumulated) - len(text)
-            keep_chars = tag_start - prior_len
-            if keep_chars > 0:
+        # MESSAGE_DELTA: rewrite stop_reason if the state tool was the
+        # only tool call. The API returns stop_reason="tool_use" when
+        # any tool was called, but the client shouldn't see that for
+        # our internal tool.
+        if event.type == SSEEventType.MESSAGE_DELTA:
+            delta = event.data.get("delta", {})
+            if (delta.get("stop_reason") == "tool_use"
+                    and self._state_tool_use_id
+                    and self._n_client_tool_uses == 0):
                 new_data = dict(event.data)
-                new_delta = dict(event.data.get("delta", {}))
-                new_delta["text"] = text[:keep_chars]
+                new_delta = dict(delta)
+                new_delta["stop_reason"] = "end_turn"
                 new_data["delta"] = new_delta
                 return SSEEvent(
                     type=event.type,
                     data=new_data,
                     raw_line=event.raw_line,
                 )
-            else:
-                return None
 
         return event
 
@@ -705,11 +721,13 @@ async def _handle_taste_message(
     """Handle a /v1/messages request through the taste gateway.
 
     Streaming: stream chunks to client AND accumulate via StreamBuffer.
-    After stream completes, reconstruct full text, process through
-    TasteGateway for state tracking + logging. The client sees the
-    tensor XML at the end of the response — that's research data.
+    The stream handler intercepts _tinkuy_state_update tool_use blocks,
+    suppressing them from the client-visible stream while accumulating
+    the JSON input. After stream completes, reconstruct full text and
+    pass the intercepted state update to TasteGateway.process_response.
 
-    Non-streaming: full round-trip, process response, return.
+    Non-streaming: full round-trip, extract state tool_use from content
+    blocks, process response, return with state tool stripped.
     """
     from starlette.responses import Response, StreamingResponse
 
@@ -811,6 +829,7 @@ async def _handle_taste_message(
                     request_body=upstream_body,
                     timing=timing,
                     feedback=feedback,
+                    state_tool_use=handler.state_tool_use,
                 )
 
                 # Also log telemetry summary to console
@@ -876,21 +895,34 @@ async def _handle_taste_message(
             )
         usage = resp_data.get("usage")
 
-        # Extract text from response
+        # Extract text and intercept state tool from response
+        from tinkuy.taste_gateway.tensor_protocol import TOOL_NAME
         text_parts = []
         content_blocks = []
+        state_tool_use = None
+        n_client_tools = 0
         for block in resp_data.get("content", []):
-            if isinstance(block, dict):
-                if block.get("type") == "text":
-                    text_parts.append(block.get("text", ""))
-                content_blocks.append(block)
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                text_parts.append(block.get("text", ""))
+            elif (block.get("type") == "tool_use"
+                    and block.get("name") == TOOL_NAME):
+                state_tool_use = {
+                    "id": block.get("id", ""),
+                    "input": block.get("input", {}),
+                }
+            else:
+                if block.get("type") == "tool_use":
+                    n_client_tools += 1
+            content_blocks.append(block)
         response_text = "\n".join(text_parts)
 
         timing = {
             "duration": t_end - t_start,
         }
 
-        # Process through taste gateway — strips tensor, tracks state
+        # Process through taste gateway — apply state update, track
         clean_text = taste_gw.process_response(
             response_text=response_text,
             session=session,
@@ -899,23 +931,32 @@ async def _handle_taste_message(
             request_body=upstream_body,
             timing=timing,
             feedback=feedback,
+            state_tool_use=state_tool_use,
         )
 
-        # Replace text in response with clean version (tensor stripped)
+        # Build client-visible content: strip state tool_use, keep rest
         cleaned_content = []
-        clean_idx = 0
+        text_replaced = False
         for block in resp_data.get("content", []):
-            if isinstance(block, dict) and block.get("type") == "text":
-                if clean_idx == 0:
-                    cleaned_content.append({
-                        **block,
-                        "text": clean_text,
-                    })
-                    clean_idx += 1
-                # Skip additional text blocks — clean_text has everything
+            if not isinstance(block, dict):
+                cleaned_content.append(block)
+                continue
+            if (block.get("type") == "tool_use"
+                    and block.get("name") == TOOL_NAME):
+                continue  # strip our internal tool
+            if block.get("type") == "text" and not text_replaced:
+                cleaned_content.append({**block, "text": clean_text})
+                text_replaced = True
+            elif block.get("type") == "text":
+                continue  # clean_text has everything
             else:
                 cleaned_content.append(block)
         resp_data["content"] = cleaned_content
+
+        # Rewrite stop_reason if our tool was the only tool call
+        if (state_tool_use and n_client_tools == 0
+                and resp_data.get("stop_reason") == "tool_use"):
+            resp_data["stop_reason"] = "end_turn"
 
         telemetry = _build_telemetry_from_json(resp_data)
         _log_request_summary_from_telemetry(telemetry)
