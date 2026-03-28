@@ -9,6 +9,11 @@ signals. No proxy paths. The tensor IS the memory. The model IS the
 curator. The gateway IS a thin wire with a mirror attached.
 """
 
-from tinkuy.taste_gateway.gateway import TasteGateway, TasteGatewayConfig
+from tinkuy.taste_gateway.gateway import (
+    MemoryObject,
+    TasteGateway,
+    TasteGatewayConfig,
+    TasteSession,
+)
 
-__all__ = ["TasteGateway", "TasteGatewayConfig"]
+__all__ = ["MemoryObject", "TasteGateway", "TasteGatewayConfig", "TasteSession"]

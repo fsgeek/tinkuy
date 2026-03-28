@@ -94,7 +94,39 @@ and the wire.
       <why>Why it was dropped</why>
     </loss>
   </declared-losses>
-</yuyay-tensor>"""
+</yuyay-tensor>
+
+## Memory Management
+
+Prior tool outputs are presented as labeled memory objects. Each has:
+- **id**: reference handle (m1, m2, ...)
+- **tool**: which tool produced it
+- **label**: what it contains (file path, command, etc.)
+- **tokens**: approximate size
+- **turn**: which cycle created it
+- **state**: "full" (original) or "summary" (compressed)
+
+You can curate memory objects by emitting <yuyay-memory> AFTER your
+response (alongside <yuyay-tensor> if you're also updating the tensor):
+
+<yuyay-memory>
+  <summarize id="m3">
+    Your summary replacing the full content. Include key findings,
+    specific numbers, and anything you might need to reference later.
+  </summarize>
+  <release id="m7">Why this is no longer needed</release>
+  <pin id="m12"/>
+</yuyay-memory>
+
+- **summarize**: Replace full content with your summary. Use when you've
+  integrated key findings into your tensor but may need specific details.
+- **release**: Drop entirely. Use when fully integrated into tensor and
+  you won't reference it again. Released objects are gone — no recall.
+- **pin**: Mark as important. The harness won't suggest releasing it.
+
+Memory curation is optional. Don't curate during tool chains — focus on
+the task. Curate at turn boundaries when the harness advises it or when
+you notice stale objects."""
 
 
 def build_tensor_system_block(
@@ -244,37 +276,48 @@ def parse_tensor_update(response_text: str) -> tuple[str, dict | None]:
     The clean text has the <yuyay-tensor> block removed — this is what
     the client sees. The update dict follows taste.py semantics.
 
+    Uses the LAST match — the model may echo example tags from the
+    protocol instructions earlier in its response. The actual update
+    is always appended at the end.
+
     Returns (response_text, None) if no tensor block found.
     """
-    match = _TENSOR_PATTERN.search(response_text)
-    if not match:
+    matches = list(_TENSOR_PATTERN.finditer(response_text))
+    if not matches:
         return response_text, None
 
-    # Strip the tensor block from visible response
-    clean = response_text[:match.start()].rstrip()
-
-    # Extract updated-regions from the opening tag
-    opening_tag = response_text[match.start():match.start() + match.group(0).index(">") + 1]
-    regions_match = re.search(r'updated-regions="([^"]*)"', opening_tag)
-    updated_regions = []
-    if regions_match:
-        updated_regions = [r.strip() for r in regions_match.group(1).split(",")]
-
-    # Parse the XML content
-    try:
-        # Wrap in a root element for parsing since the tensor block
-        # content might have the updated-regions in the tag
+    # Try matches from last to first — the actual protocol output is
+    # typically at the end. Earlier matches may be the model discussing
+    # the protocol in conversation.
+    for match in reversed(matches):
         full_xml = match.group(0)
-        root = ET.fromstring(full_xml)
+        try:
+            root = ET.fromstring(full_xml)
+        except ET.ParseError:
+            # Not valid XML — the model is mentioning the tag in
+            # conversation, not emitting protocol output. Skip it.
+            continue
+
+        # Valid XML — this is a real tensor update. Strip it.
+        clean = (
+            response_text[:match.start()].rstrip()
+            + response_text[match.end():]
+        ).rstrip()
+
+        # Extract updated-regions from the opening tag
+        opening_tag = full_xml[:full_xml.index(">") + 1]
+        regions_match = re.search(r'updated-regions="([^"]*)"', opening_tag)
+        updated_regions = []
+        if regions_match:
+            updated_regions = [
+                r.strip() for r in regions_match.group(1).split(",")
+            ]
+
         update = _xml_to_tensor_update(root, updated_regions)
         return clean, update
-    except ET.ParseError as e:
-        # Malformed XML — carry forward prior tensor unchanged
-        import logging
-        logging.getLogger("tinkuy.taste_gateway").warning(
-            "Failed to parse tensor XML: %s", e
-        )
-        return clean, None
+
+    # All matches were invalid XML — leave the response untouched
+    return response_text, None
 
 
 def _xml_to_tensor_update(root: ET.Element, updated_regions: list[str]) -> dict:
@@ -406,6 +449,83 @@ def _xml_to_tensor_update(root: ET.Element, updated_regions: list[str]) -> dict:
         }
 
     return update
+
+
+# ---------------------------------------------------------------------------
+# Response parsing — extract memory curation signals from model output
+# ---------------------------------------------------------------------------
+
+_MEMORY_PATTERN = re.compile(
+    r"<yuyay-memory>(.*?)</yuyay-memory>",
+    re.DOTALL,
+)
+
+
+def parse_memory_signals(response_text: str) -> tuple[str, list[dict]]:
+    """Extract memory curation signals from response, return (clean_text, signals).
+
+    The clean text has the <yuyay-memory> block removed. Each signal is a dict:
+        {"action": "summarize"|"release"|"pin", "id": "m3", "content": "..."}
+
+    If a match isn't valid protocol content (no recognizable signals),
+    it's treated as the model mentioning the tag in conversation and
+    left in the response untouched.
+
+    Returns (response_text, []) if no memory block found.
+    """
+    matches = list(_MEMORY_PATTERN.finditer(response_text))
+    if not matches:
+        return response_text, []
+
+    for match in reversed(matches):
+        xml_content = match.group(1)
+        signals: list[dict] = []
+
+        # Parse summarize signals
+        for m in re.finditer(
+            r'<summarize\s+id="([^"]+)">(.*?)</summarize>',
+            xml_content, re.DOTALL,
+        ):
+            signals.append({
+                "action": "summarize",
+                "id": m.group(1),
+                "content": m.group(2).strip(),
+            })
+
+        # Parse release signals
+        for m in re.finditer(
+            r'<release\s+id="([^"]+)">(.*?)</release>',
+            xml_content, re.DOTALL,
+        ):
+            signals.append({
+                "action": "release",
+                "id": m.group(1),
+                "reason": m.group(2).strip(),
+            })
+
+        # Parse pin signals
+        for m in re.finditer(
+            r'<pin\s+id="([^"]+)"\s*/>', xml_content,
+        ):
+            signals.append({
+                "action": "pin",
+                "id": m.group(1),
+            })
+
+        if not signals:
+            # No recognizable signals — the model is mentioning
+            # the tag in conversation. Leave it in the response.
+            continue
+
+        # Valid signals found — strip this block from the response
+        clean = (
+            response_text[:match.start()].rstrip()
+            + response_text[match.end():]
+        ).rstrip()
+        return clean, signals
+
+    # No valid memory blocks found
+    return response_text, []
 
 
 # ---------------------------------------------------------------------------

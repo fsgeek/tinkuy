@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -27,6 +26,7 @@ from tinkuy.taste_gateway.tensor_protocol import (
     build_tensor_system_block,
     extract_session_tag,
     make_session_tag,
+    parse_memory_signals,
     parse_tensor_update,
 )
 
@@ -42,8 +42,9 @@ def _generate_feedback(
     cycle: int,
     loss_history: list[dict] | None = None,
     integration_loss_history: list[dict] | None = None,
+    memory_objects: list["MemoryObject"] | None = None,
 ) -> list[str]:
-    """Generate harness feedback based on tensor health."""
+    """Generate harness feedback based on tensor and memory health."""
     if tensor is None:
         return []
 
@@ -114,6 +115,39 @@ def _generate_feedback(
             feedback.append(
                 f"HARNESS NOTE: {len(recent)} integration loss(es) over last "
                 f"5 cycles. Most recent: {'; '.join(latest)}"
+            )
+
+    # --- Memory object feedback ---
+    if memory_objects:
+        n_objects = len(memory_objects)
+        memory_tokens = sum(m.tokens for m in memory_objects)
+        n_full = sum(1 for m in memory_objects if m.state == "full")
+        n_summary = sum(1 for m in memory_objects if m.state == "summary")
+
+        if memory_tokens > 50000:
+            feedback.append(
+                f"HARNESS FEEDBACK: {n_objects} memory objects using "
+                f"~{memory_tokens:,} tokens ({n_full} full, {n_summary} "
+                f"summarized). Consider summarizing or releasing stale objects."
+            )
+        elif memory_tokens > 20000:
+            feedback.append(
+                f"HARNESS NOTE: {n_objects} memory objects, "
+                f"~{memory_tokens:,} tokens ({n_full} full, {n_summary} "
+                f"summarized)."
+            )
+
+        # Flag old unpinned objects
+        old_objects = [
+            m for m in memory_objects
+            if not m.pinned and m.state == "full"
+            and (cycle - m.turn) >= 10
+        ]
+        if old_objects:
+            ids = ", ".join(m.id for m in old_objects[:5])
+            feedback.append(
+                f"HARNESS NOTE: {len(old_objects)} full memory objects from "
+                f"10+ cycles ago (unpinned): {ids}. Still needed?"
             )
 
     return feedback
@@ -227,84 +261,166 @@ def _find_current_turn_start(messages: list[dict]) -> int:
     return 0
 
 
-def _extract_prior_tool_context(
+def _extract_tool_exchanges(
     messages: list[dict], current_turn_start: int,
-) -> str:
-    """Extract tool exchanges from prior turns as text for a system block.
+) -> list[dict[str, Any]]:
+    """Extract tool exchanges from prior turns as structured data.
 
-    Walks messages before current_turn_start, collecting tool_use (from
-    assistant messages) and tool_result (from user messages) as readable
-    text. Conversational messages are skipped — the tensor carries those.
+    Returns a list of dicts, each representing one tool exchange:
+        {tool_name, tool_input, tool_use_id, result_text}
+
+    Walks messages before current_turn_start, pairing tool_use blocks
+    (from assistant messages) with their tool_result blocks (from user
+    messages). Conversational messages are skipped — the tensor carries those.
     """
     if current_turn_start == 0:
-        return ""
+        return []
 
-    parts: list[str] = []
+    # First pass: collect tool_use blocks indexed by id
+    tool_uses: dict[str, dict] = {}
     for msg in messages[:current_turn_start]:
-        role = msg.get("role", "")
+        if msg.get("role") != "assistant":
+            continue
         content = msg.get("content", "")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                tool_uses[block.get("id", "")] = {
+                    "tool_name": block.get("name", "?"),
+                    "tool_input": block.get("input", {}),
+                }
 
-        if role == "assistant" and isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "tool_use":
-                    name = block.get("name", "?")
-                    inp = block.get("input", {})
-                    # Compact representation of tool input
-                    if isinstance(inp, dict):
-                        # Show key params, truncate large values
-                        summary_parts = []
-                        for k, v in inp.items():
-                            v_str = str(v)
-                            if len(v_str) > 200:
-                                v_str = v_str[:200] + "..."
-                            summary_parts.append(f"{k}={v_str}")
-                        inp_summary = ", ".join(summary_parts)
-                    else:
-                        inp_summary = str(inp)[:200]
-                    parts.append(f"[tool_use: {name}({inp_summary})]")
+    # Second pass: collect tool_result blocks, pair with tool_use
+    exchanges: list[dict[str, Any]] = []
+    for msg in messages[:current_turn_start]:
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content", "")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not (isinstance(block, dict) and block.get("type") == "tool_result"):
+                continue
+            tool_use_id = block.get("tool_use_id", "")
+            result_content = block.get("content", "")
+            if isinstance(result_content, list):
+                texts = []
+                for rb in result_content:
+                    if isinstance(rb, dict) and rb.get("type") == "text":
+                        texts.append(rb.get("text", ""))
+                result_text = "\n".join(texts)
+            elif isinstance(result_content, str):
+                result_text = result_content
+            else:
+                result_text = str(result_content)
 
-        elif role == "user" and isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "tool_result":
-                    tool_id = block.get("tool_use_id", "?")
-                    result_content = block.get("content", "")
-                    if isinstance(result_content, list):
-                        # Extract text from content blocks
-                        texts = []
-                        for rb in result_content:
-                            if isinstance(rb, dict) and rb.get("type") == "text":
-                                texts.append(rb.get("text", ""))
-                        result_text = "\n".join(texts)
-                    elif isinstance(result_content, str):
-                        result_text = result_content
-                    else:
-                        result_text = str(result_content)
-                    parts.append(f"[tool_result: {tool_id}]\n{result_text}")
+            use = tool_uses.get(tool_use_id, {})
+            exchanges.append({
+                "tool_name": use.get("tool_name", "?"),
+                "tool_input": use.get("tool_input", {}),
+                "tool_use_id": tool_use_id,
+                "result_text": result_text,
+            })
 
-    if not parts:
+    return exchanges
+
+
+def _build_memory_objects(
+    exchanges: list[dict[str, Any]],
+    session: "TasteSession",
+    current_cycle: int,
+) -> None:
+    """Convert new tool exchanges into labeled MemoryObjects on the session.
+
+    Only creates objects for exchanges not already tracked (by tool_use_id).
+    Existing objects are preserved with their current state (may have been
+    summarized or pinned).
+    """
+    known_ids = {m.tool_use_id for m in session.memory_objects}
+
+    for ex in exchanges:
+        tool_use_id = ex["tool_use_id"]
+        if tool_use_id in known_ids:
+            continue  # already tracked
+
+        tool_name = ex["tool_name"]
+        content = ex["result_text"]
+        tokens = len(content) // 4
+
+        obj = MemoryObject(
+            id=session.next_memory_id(),
+            tool=tool_name,
+            label=MemoryObject.make_label(tool_name, ex["tool_input"]),
+            content=content,
+            tokens=tokens,
+            turn=current_cycle,
+            cycle=current_cycle,
+            tool_use_id=tool_use_id,
+            original_tokens=tokens,
+        )
+        session.memory_objects.append(obj)
+
+
+def _render_memory_block(session: "TasteSession") -> str:
+    """Render memory objects as labeled XML for the system prompt.
+
+    Each object is individually addressable by its id. The model sees
+    the tool name, semantic label, size, source turn, and state.
+    """
+    if not session.memory_objects:
         return ""
 
-    return "<prior-tool-outputs>\n" + "\n\n".join(parts) + "\n</prior-tool-outputs>"
+    lines = ["<prior-tool-outputs>"]
+    for m in session.memory_objects:
+        attrs = (
+            f'id="{m.id}" tool="{m.tool}" label="{_esc_attr(m.label)}" '
+            f'tokens="~{m.tokens}" turn="{m.turn}" state="{m.state}"'
+        )
+        if m.pinned:
+            attrs += ' pinned="true"'
+        lines.append(f"  <memory {attrs}>")
+        lines.append(m.content)
+        lines.append("  </memory>")
+    lines.append("</prior-tool-outputs>")
+    return "\n".join(lines)
 
 
-def _build_taste_messages(messages: list[dict]) -> tuple[list[dict[str, Any]], str]:
+def _esc_attr(text: str) -> str:
+    """Escape XML attribute value."""
+    return (text
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;"))
+
+
+def _build_taste_messages(
+    messages: list[dict],
+    session: "TasteSession",
+    current_cycle: int,
+) -> list[dict[str, Any]]:
     """Taste model: current turn + tensor. Prior conversation in tensor,
-    prior tool outputs in system block.
+    prior tool outputs as labeled memory objects in system block.
 
-    Returns (current_turn_messages, prior_tool_context).
+    Returns current_turn_messages. Side effect: populates session.memory_objects
+    with labeled MemoryObjects from prior-turn tool exchanges.
 
     The current turn is everything from the last user text message onward.
-    Tool exchanges from prior turns are extracted as text for a system block.
-    Prior conversation (user text + assistant responses) is dropped — the
-    tensor carries that state.
+    Tool exchanges from prior turns are converted to memory objects (tracked
+    on the session). Prior conversation (user text + assistant responses)
+    is dropped — the tensor carries that state.
 
     Strips client cache_control — the gateway owns cache placement.
     """
     if not messages:
-        return [], ""
+        return []
 
     current_turn_start = _find_current_turn_start(messages)
-    prior_tool_context = _extract_prior_tool_context(messages, current_turn_start)
+
+    # Build memory objects from prior-turn tool exchanges
+    exchanges = _extract_tool_exchanges(messages, current_turn_start)
+    _build_memory_objects(exchanges, session, current_cycle)
 
     # Current turn: everything from the human message onward
     turn_messages = []
@@ -317,7 +433,7 @@ def _build_taste_messages(messages: list[dict]) -> tuple[list[dict[str, Any]], s
     # preceding assistant message. Pull it in.
     turn_messages = _repair_tool_orphans(turn_messages, messages, current_turn_start)
 
-    return turn_messages, prior_tool_context
+    return turn_messages
 
 
 def _repair_tool_orphans(
@@ -381,8 +497,8 @@ def _repair_tool_orphans(
             ]
 
     # No matching assistant found — the tool_results are truly orphaned.
-    # Strip them from the first message. The prior_tool_context system
-    # block already captured them as text, so nothing is lost.
+    # Strip them from the first message. The memory objects system
+    # block already captured them, so nothing is lost.
     if isinstance(first_content, list):
         cleaned = [
             b for b in first_content
@@ -426,6 +542,50 @@ class TasteGatewayConfig:
 
 
 # ---------------------------------------------------------------------------
+# Memory objects — labeled, individually addressable tool outputs
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MemoryObject:
+    """A labeled memory object — one tool exchange (use + result).
+
+    The model sees these as labeled blocks in the system prompt and can
+    curate them via <yuyay-memory> signals: summarize, release, pin.
+    """
+    id: str                     # monotonic: m1, m2, m3, ...
+    tool: str                   # tool name (Read, Bash, Glob, etc.)
+    label: str                  # semantic label (file path, command, etc.)
+    content: str                # full result text or model-provided summary
+    tokens: int                 # approximate token count (len // 4)
+    turn: int                   # human turn that produced this
+    cycle: int                  # cycle when created
+    state: str = "full"         # "full" | "summary"
+    pinned: bool = False
+    tool_use_id: str = ""       # original tool_use_id for tracing
+    original_tokens: int = 0    # tokens before summarization
+
+    @staticmethod
+    def make_label(tool_name: str, tool_input: dict | str) -> str:
+        """Derive a semantic label from tool name + input."""
+        if isinstance(tool_input, str):
+            return tool_input[:60]
+        # Extract the most informative parameter
+        for key in ("file_path", "command", "pattern", "query", "url",
+                     "path", "skill", "prompt", "operation"):
+            val = tool_input.get(key)
+            if val:
+                val_str = str(val)
+                if len(val_str) > 55:
+                    val_str = val_str[:52] + "..."
+                return val_str
+        # Fallback: first string value
+        for v in tool_input.values():
+            if isinstance(v, str) and v:
+                return str(v)[:60]
+        return tool_name
+
+
+# ---------------------------------------------------------------------------
 # Session state
 # ---------------------------------------------------------------------------
 
@@ -439,11 +599,20 @@ class TasteSession:
     integration_loss_history: list[dict] = field(default_factory=list)
     tag_injected: bool = False
     log_path: Path | None = None
+    memory_objects: list[MemoryObject] = field(default_factory=list)
+    _memory_seq: int = 0  # next sequence number for memory IDs
 
     def tensor_token_estimate(self) -> int:
         if self.tensor is None:
             return 0
         return len(json.dumps(self.tensor)) // 4
+
+    def memory_token_estimate(self) -> int:
+        return sum(m.tokens for m in self.memory_objects)
+
+    def next_memory_id(self) -> str:
+        self._memory_seq += 1
+        return f"m{self._memory_seq}"
 
 
 # ---------------------------------------------------------------------------
@@ -548,12 +717,47 @@ class TasteGateway:
                 for il in entry.get("cycle_integration_losses", []):
                     session.integration_loss_history.append(il)
 
+        # Restore memory sequence counter from summary
+        mem_summary = record.get("memory_objects_summary", [])
+        if mem_summary:
+            max_seq = 0
+            for ms in mem_summary:
+                mid = ms.get("id", "")
+                if mid.startswith("m"):
+                    try:
+                        max_seq = max(max_seq, int(mid[1:]))
+                    except ValueError:
+                        pass
+            session._memory_seq = max_seq
+            # Note: memory objects themselves will be rebuilt from the
+            # message array on the next request. Curated state (summaries,
+            # pins) is restored below from the curated_memory field.
+
+        # Restore curated memory objects (summarized/pinned)
+        for cm in record.get("curated_memory", []):
+            obj = MemoryObject(
+                id=cm["id"],
+                tool=cm.get("tool", "?"),
+                label=cm.get("label", ""),
+                content=cm.get("content", ""),
+                tokens=cm.get("tokens", 0),
+                turn=cm.get("turn", 0),
+                cycle=cm.get("cycle", 0),
+                state=cm.get("state", "summary"),
+                pinned=cm.get("pinned", False),
+                tool_use_id=cm.get("tool_use_id", ""),
+                original_tokens=cm.get("original_tokens", 0),
+            )
+            session.memory_objects.append(obj)
+
         log.info(
-            "restored taste session %s: cycle=%d, %d strands, ~%d tokens",
+            "restored taste session %s: cycle=%d, %d strands, ~%d tokens, "
+            "%d memory objects",
             session_id,
             session.cycle,
             len(session.tensor.get("strands", [])) if session.tensor else 0,
             session.tensor_token_estimate(),
+            len(session.memory_objects),
         )
         return session
 
@@ -592,6 +796,7 @@ class TasteGateway:
                 session.cycle,
                 loss_history=session.loss_history,
                 integration_loss_history=session.integration_loss_history,
+                memory_objects=session.memory_objects,
             )
 
         # Build tensor system block — read-only during tool cycles
@@ -629,13 +834,13 @@ class TasteGateway:
             system_blocks[-1] = dict(system_blocks[-1])
             system_blocks[-1]["cache_control"] = {"type": "ephemeral"}
 
-        # --- Taste model: current turn + prior tool outputs ---
-        # Prior conversation is in the tensor. Prior tool outputs go in
-        # a system block. Current turn goes in messages.
-        our_messages, prior_tool_context = _build_taste_messages(messages)
+        # --- Taste model: current turn + labeled memory objects ---
+        # Prior conversation is in the tensor. Prior tool outputs become
+        # labeled memory objects in a system block. Current turn in messages.
+        our_messages = _build_taste_messages(messages, session, session.cycle)
 
         # BP2: tensor block — small and stable (only changes at turn
-        # boundaries). Placing it before tool outputs means cache busts
+        # boundaries). Placing it before memory objects means cache busts
         # from growing tool results don't invalidate the tensor prefix.
         system_blocks.append({
             "type": "text",
@@ -643,12 +848,13 @@ class TasteGateway:
             "cache_control": {"type": "ephemeral"},
         })
 
-        # BP3: prior tool outputs — large, grows during tool chains.
-        # Cache busts here only affect this block, not the stable prefix.
-        if prior_tool_context:
+        # BP3: memory objects — labeled prior tool outputs.
+        # Grows during tool chains. Model can curate via signals.
+        memory_block = _render_memory_block(session)
+        if memory_block:
             system_blocks.append({
                 "type": "text",
-                "text": prior_tool_context,
+                "text": memory_block,
                 "cache_control": {"type": "ephemeral"},
             })
 
@@ -723,8 +929,12 @@ class TasteGateway:
         The clean text (tensor stripped) is what the client sees. The
         session tag is injected into the first response for a new session.
         """
-        # Parse tensor update from response
+        # Parse tensor update and memory signals from response
         clean_text, raw_update = parse_tensor_update(response_text)
+        clean_text, memory_signals = parse_memory_signals(clean_text)
+
+        # Apply memory curation signals
+        memory_events = self._apply_memory_signals(session, memory_signals)
 
         # Capture prior tensor for logging
         prior_tensor = (
@@ -768,22 +978,23 @@ class TasteGateway:
             timing=timing,
             feedback=feedback,
             content_blocks=content_blocks,
+            memory_events=memory_events,
         )
 
         # Console: the numbers that matter
         if self.config.enable_console and usage:
             input_tok = usage.get("input_tokens", 0)
             cache_read = usage.get("cache_read_input_tokens", 0)
-            cache_create = usage.get("cache_creation_input_tokens", 0)
             output_tok = usage.get("output_tokens", 0)
             total_in = input_tok + cache_read
             cache_pct = (cache_read / total_in * 100) if total_in > 0 else 0
             tensor_tok = session.tensor_token_estimate()
+            mem_tok = session.memory_token_estimate()
             log.info(
                 "  COST | in=%s+%scache/%sout total=%s "
-                "cache:%0.f%% tensor=~%d",
+                "cache:%.0f%% tensor=~%d memory=~%d",
                 f"{input_tok:,}", f"{cache_read:,}", f"{output_tok:,}",
-                f"{total_in:,}", cache_pct, tensor_tok,
+                f"{total_in:,}", cache_pct, tensor_tok, mem_tok,
             )
 
         if raw_update is None:
@@ -803,6 +1014,89 @@ class TasteGateway:
 
         return clean_text
 
+    # --- Memory curation ---
+
+    def _apply_memory_signals(
+        self, session: TasteSession, signals: list[dict],
+    ) -> list[dict]:
+        """Apply memory curation signals from the model's response.
+
+        Returns a list of event dicts for logging. Each event records
+        what happened: summarize (with before/after tokens), release
+        (with reason), or pin.
+        """
+        if not signals:
+            return []
+
+        events: list[dict] = []
+        obj_by_id = {m.id: m for m in session.memory_objects}
+
+        for signal in signals:
+            action = signal["action"]
+            obj_id = signal["id"]
+            obj = obj_by_id.get(obj_id)
+
+            if obj is None:
+                log.warning(
+                    "memory signal for unknown id %s (action=%s)",
+                    obj_id, action,
+                )
+                events.append({
+                    "action": action, "id": obj_id,
+                    "status": "error", "reason": "unknown id",
+                })
+                continue
+
+            if action == "summarize":
+                prior_tokens = obj.tokens
+                obj.content = signal["content"]
+                obj.tokens = len(obj.content) // 4
+                obj.state = "summary"
+                events.append({
+                    "action": "summarize",
+                    "id": obj_id,
+                    "tool": obj.tool,
+                    "label": obj.label,
+                    "prior_tokens": prior_tokens,
+                    "new_tokens": obj.tokens,
+                    "reduction": prior_tokens - obj.tokens,
+                    "cycle": session.cycle,
+                })
+                log.info(
+                    "  memory | summarize %s (%s) %d→%d tokens",
+                    obj_id, obj.label, prior_tokens, obj.tokens,
+                )
+
+            elif action == "release":
+                reason = signal.get("reason", "")
+                events.append({
+                    "action": "release",
+                    "id": obj_id,
+                    "tool": obj.tool,
+                    "label": obj.label,
+                    "tokens_freed": obj.tokens,
+                    "reason": reason,
+                    "cycle": session.cycle,
+                })
+                log.info(
+                    "  memory | release %s (%s) freed %d tokens: %s",
+                    obj_id, obj.label, obj.tokens, reason,
+                )
+                session.memory_objects.remove(obj)
+
+            elif action == "pin":
+                obj.pinned = True
+                events.append({
+                    "action": "pin",
+                    "id": obj_id,
+                    "tool": obj.tool,
+                    "label": obj.label,
+                    "cycle": session.cycle,
+                })
+                log.info("  memory | pin %s (%s)", obj_id, obj.label)
+
+        return events
+
     # --- Logging ---
 
     def _log_cycle(
@@ -817,6 +1111,7 @@ class TasteGateway:
         timing: dict | None = None,
         feedback: list[str] | None = None,
         content_blocks: list[dict] | None = None,
+        memory_events: list[dict] | None = None,
     ) -> None:
         """Log everything. Every cycle, whether or not a tensor update was found.
 
@@ -882,6 +1177,33 @@ class TasteGateway:
             "n_open_questions": len(tensor.get("open_questions", [])),
             "n_tensions": len(tensor.get("unresolved_tensions", [])),
             "tensor_token_estimate": session.tensor_token_estimate(),
+            # Memory objects
+            "n_memory_objects": len(session.memory_objects),
+            "memory_token_estimate": session.memory_token_estimate(),
+            "memory_objects_summary": [
+                {
+                    "id": m.id, "tool": m.tool, "label": m.label,
+                    "tokens": m.tokens, "state": m.state,
+                    "pinned": m.pinned, "turn": m.turn,
+                }
+                for m in session.memory_objects
+            ],
+            "memory_events": memory_events or [],
+            # Curated memory objects (summarized/pinned) — needed for restore.
+            # Full objects rebuild from messages, but curation state is lost
+            # without this.
+            "curated_memory": [
+                {
+                    "id": m.id, "tool": m.tool, "label": m.label,
+                    "content": m.content, "tokens": m.tokens,
+                    "turn": m.turn, "cycle": m.cycle,
+                    "state": m.state, "pinned": m.pinned,
+                    "tool_use_id": m.tool_use_id,
+                    "original_tokens": m.original_tokens,
+                }
+                for m in session.memory_objects
+                if m.state != "full" or m.pinned
+            ],
             # Usage from API — raw and derived
             "usage": usage,
             "cache_stats": cache_stats,
@@ -904,11 +1226,13 @@ class TasteGateway:
         n_strands = len(t.get("strands", []))
         n_tensions = len(t.get("unresolved_tensions", []))
         tokens = session.tensor_token_estimate()
+        n_mem = len(session.memory_objects)
+        mem_tokens = session.memory_token_estimate()
         log.info(
             "taste | session=%s cycle=%d strands=%d tensions=%d "
-            "tensor=~%d tokens losses=%d cumulative",
+            "tensor=~%d memory=%d(~%d tok) losses=%d cumulative",
             session.session_id, session.cycle, n_strands, n_tensions,
-            tokens, len(session.loss_history),
+            tokens, n_mem, mem_tokens, len(session.loss_history),
         )
         for f in feedback:
             log.info("  %s", f)

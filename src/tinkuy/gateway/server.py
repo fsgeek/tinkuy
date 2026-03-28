@@ -648,8 +648,28 @@ class _TasteStreamHandler:
 
         self._accumulated += text
 
-        # Check for tensor start tag
-        tag_start = self._accumulated.find("<yuyay-tensor")
+        # Check for protocol output tags — these are invisible to client.
+        # Only suppress on real protocol output, not conversational mentions.
+        # Real tensor updates have 'updated-regions=' in the opening tag.
+        # Real memory signals have '<summarize', '<release', or '<pin' inside.
+        # A conversational mention like "the <yuyay-tensor> tag" won't match.
+        tag_start = -1
+        for marker in ["<yuyay-tensor ", "<yuyay-tensor\n"]:
+            pos = self._accumulated.find(marker)
+            if pos >= 0 and "updated-regions=" in self._accumulated[pos:pos+200]:
+                tag_start = pos
+                break
+        if tag_start < 0:
+            for marker in ["<yuyay-memory>"]:
+                pos = self._accumulated.find(marker)
+                if pos >= 0:
+                    # Check for actual signal content after the tag
+                    after = self._accumulated[pos:]
+                    if any(sig in after for sig in
+                           ["<summarize ", "<release ", "<pin "]):
+                        tag_start = pos
+                        break
+
         if tag_start >= 0:
             self._suppressing = True
             prior_len = len(self._accumulated) - len(text)
