@@ -68,6 +68,7 @@ def create_app(
     upstream: str | None = None,
     gemini_upstream: str | None = None,
     taste: bool = False,
+    taste_passthrough: bool = False,
 ) -> Any:
     """Create the FastAPI application.
 
@@ -98,6 +99,7 @@ def create_app(
             data_dir=config.data_dir,
             enable_console=True,
             context_limit=config.context_limit,
+            passthrough_messages=taste_passthrough,
         ))
 
     # Per-session gateways, keyed by session ID or a default
@@ -915,7 +917,10 @@ async def _handle_taste_message(
             else:
                 if block.get("type") == "tool_use":
                     n_client_tools += 1
-            content_blocks.append(block)
+            # Append everything except the state tool to content_blocks
+            if not (block.get("type") == "tool_use"
+                    and block.get("name") == TOOL_NAME):
+                content_blocks.append(block)
         response_text = "\n".join(text_parts)
 
         timing = {
@@ -1196,6 +1201,7 @@ def serve(
     data_dir: str | None = None,
     context_limit: int = 200_000,
     taste: bool = False,
+    taste_passthrough: bool = False,
 ) -> None:
     """Start the tinkuy gateway server.
 
@@ -1249,13 +1255,14 @@ def serve(
         upstream=upstream,
         gemini_upstream=gemini_upstream,
         taste=taste,
+        taste_passthrough=taste_passthrough,
     )
 
     anthropic_url = _resolve_upstream("anthropic", upstream)
     gemini_url = _resolve_upstream("gemini", gemini_upstream)
     base_url = f"http://127.0.0.1:{port}"
 
-    mode_label = "TASTE" if taste else "standard"
+    mode_label = "TASTE+PASSTHROUGH" if taste_passthrough else ("TASTE" if taste else "standard")
     print(f"\n  tinkuy gateway [{mode_label}] listening on {base_url}", file=sys.stderr)
     print(f"  anthropic upstream: {anthropic_url}", file=sys.stderr)
     print(f"  gemini upstream:    {gemini_url}", file=sys.stderr)

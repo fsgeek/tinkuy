@@ -44,6 +44,10 @@ def main() -> None:
         "--taste", action="store_true",
         help="Use taste-native gateway (model self-curates via tensor)",
     )
+    serve_p.add_argument(
+        "--taste-passthrough", action="store_true",
+        help="Taste mode: pass all client messages through (for clients that manage their own context)",
+    )
 
     args = parser.parse_args()
 
@@ -56,6 +60,7 @@ def main() -> None:
             data_dir=args.data_dir,
             context_limit=args.context_limit,
             taste=args.taste,
+            taste_passthrough=getattr(args, "taste_passthrough", False),
         )
     else:
         parser.print_help()

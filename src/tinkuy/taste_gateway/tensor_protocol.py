@@ -12,8 +12,11 @@ haven't defined. We carry them faithfully and log them.
 """
 
 import json
+import logging
 import re
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 from pydantic import BaseModel, ConfigDict
 
@@ -161,15 +164,13 @@ faithfully. We don't interpret them yet."""
 def build_tensor_system_block(
     tensor: dict | None,
     cycle: int,
-    feedback: list[str] | None = None,
     tool_cycle: bool = False,
 ) -> str:
     """Build the system prompt block containing protocol + state as JSON.
 
     When tool_cycle=True, the state is included read-only (so the model
-    knows its own state) but the update protocol and feedback are omitted.
-    The model should focus on the task, not on curation. State updates
-    happen at turn boundaries, not during tool chains.
+    knows its own state) but the update protocol is omitted.
+    Harness feedback travels via the tool_result channel, not here.
     """
     if tool_cycle:
         parts = [
@@ -194,13 +195,6 @@ def build_tensor_system_block(
             "This is cycle 1 — no prior state. Initialize all regions."
         )
 
-    # Feedback now goes in the tool_result, not here — but keep for
-    # tool cycles where there's no tool_result channel.
-    if feedback:
-        parts.append("\n## Harness Feedback\n")
-        for f in feedback:
-            parts.append(f)
-
     return "\n".join(parts)
 
 
@@ -213,6 +207,32 @@ def _tensor_to_json(tensor: dict) -> str:
 # State update processing — parse and convert to update dict
 # ---------------------------------------------------------------------------
 
+def _deserialize_string_fields(tool_input: dict) -> dict:
+    """Models sometimes send nested structures as JSON-encoded strings.
+
+    Walk the input dict and attempt json.loads on any string value that
+    looks like a JSON array or object.  This lets Pydantic see actual
+    lists/dicts instead of opaque strings.
+    """
+    out = {}
+    for k, v in tool_input.items():
+        if isinstance(v, str) and v.lstrip().startswith(("[", "{")):
+            # Models sometimes produce trailing commas or whitespace after
+            # the closing bracket/brace — strip before parsing.
+            cleaned = v.strip().rstrip(",").strip()
+            try:
+                out[k] = json.loads(cleaned)
+            except (json.JSONDecodeError, ValueError):
+                log.warning(
+                    "field %r looks like JSON but failed to parse: %s",
+                    k, v[:200],
+                )
+                out[k] = v
+        else:
+            out[k] = v
+    return out
+
+
 def parse_state_update(tool_input: dict) -> dict:
     """Validate and convert a tool_use input dict to an update dict.
 
@@ -220,7 +240,8 @@ def parse_state_update(tool_input: dict) -> dict:
     converts to a plain dict for _apply_updates. Extra fields (unknown
     to the schema) are preserved.
     """
-    update = StateUpdate.model_validate(tool_input)
+    cleaned = _deserialize_string_fields(tool_input)
+    update = StateUpdate.model_validate(cleaned)
     return update.model_dump(exclude_none=True)
 
 

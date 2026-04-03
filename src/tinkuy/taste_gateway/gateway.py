@@ -184,7 +184,7 @@ def _apply_updates(
         )
 
     for key in ["overall_truth", "overall_indeterminacy", "overall_falsity"]:
-        if key in raw_update:
+        if key in raw_update and key in updated_regions:
             tensor[key] = raw_update[key]
 
     # feedback_to_harness is per-cycle
@@ -204,6 +204,19 @@ def _apply_updates(
     # Strip integration_losses from strands (per-cycle only)
     for strand in tensor.get("strands", []):
         strand.pop("integration_losses", None)
+
+    # Late binding: carry through any extra fields the model added.
+    # The Pydantic schema uses extra='allow' — honour that contract.
+    _known_keys = {
+        "updated_regions", "memory_actions", "cycle",
+        "strands", "declared_losses", "open_questions",
+        "unresolved_tensions", "instructions_for_next",
+        "overall_truth", "overall_indeterminacy", "overall_falsity",
+        "feedback_to_harness",
+    }
+    for key in updated_regions:
+        if key not in _known_keys and key in raw_update:
+            tensor[key] = raw_update[key]
 
     return tensor
 
@@ -542,6 +555,7 @@ class TasteGatewayConfig:
     data_dir: str | None = None
     enable_console: bool = True
     context_limit: int = 200_000
+    passthrough_messages: bool = False  # Skip message reduction; inject tensor + tool only
 
 
 # ---------------------------------------------------------------------------
@@ -843,10 +857,19 @@ class TasteGateway:
             system_blocks[-1] = dict(system_blocks[-1])
             system_blocks[-1]["cache_control"] = {"type": "ephemeral"}
 
-        # --- Taste model: current turn + labeled memory objects ---
-        # Prior conversation is in the tensor. Prior tool outputs become
-        # labeled memory objects in a system block. Current turn in messages.
-        our_messages = _build_taste_messages(messages, session, session.cycle)
+        # --- Message handling ---
+        # Default taste model: current turn only + labeled memory objects.
+        # Passthrough mode: keep all client messages (for clients like aider
+        # that manage their own context). In both modes, tensor + tool are
+        # injected and state updates are intercepted.
+        if self.config.passthrough_messages:
+            # Strip client cache_control but keep all messages
+            our_messages = [
+                {"role": msg["role"], "content": _strip_cache_control(msg.get("content", ""))}
+                for msg in messages
+            ]
+        else:
+            our_messages = _build_taste_messages(messages, session, session.cycle)
 
         # Inject synthetic tool_result exchange from prior cycle's state
         # update. The API requires every tool_use to get a tool_result.
@@ -986,12 +1009,21 @@ class TasteGateway:
         """
         clean_text = response_text
 
-        # Extract state update from intercepted tool call
+        # Extract state update from intercepted tool call.
+        # IMPORTANT: Always store pending_state_tool_use first so the
+        # synthetic tool_result can be injected on the next request even
+        # if parsing fails.  An orphaned tool_use with no tool_result
+        # corrupts the session permanently.
         raw_update = None
         if state_tool_use is not None:
-            raw_update = parse_state_update(state_tool_use["input"])
-            # Store for synthetic tool_result injection on next request
             session.pending_state_tool_use = state_tool_use
+            try:
+                raw_update = parse_state_update(state_tool_use["input"])
+            except Exception:
+                log.exception(
+                    "Failed to parse state update — tensor not updated "
+                    "but tool_result will still be injected next cycle"
+                )
 
         # Apply memory actions from the state update
         memory_actions = []

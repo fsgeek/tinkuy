@@ -1,8 +1,11 @@
 """Streaming buffer library for SSE packet parsing and reconstruction.
 
-Handles the full vocabulary of Anthropic SSE events with fail-stop
-on unrecognized types. Data flows THROUGH the buffer — bytes in,
-bytes out — with structured reconstruction as a side effect.
+Data flows THROUGH the buffer — bytes in, bytes out — with structured
+reconstruction as a side effect. The gateway understands text, thinking,
+and tool_use blocks. All other block types pass through as opaque —
+carried faithfully without interpretation. Unknown delta types within
+opaque blocks are accumulated if they carry partial_json, ignored
+otherwise.
 
 This module has zero dependencies on other tinkuy modules. It is
 testable in complete isolation.
@@ -18,9 +21,12 @@ Components (bottom-up):
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, Protocol
+
+log = logging.getLogger("tinkuy.stream")
 
 
 # --- Exceptions ---
@@ -71,11 +77,20 @@ class SSEEventType(Enum):
 
 
 class BlockType(Enum):
-    """Content block types in assistant responses."""
+    """Content block types in assistant responses.
+
+    The gateway understands TEXT, THINKING, TOOL_USE, and
+    REDACTED_THINKING. All other block types (server_tool_use,
+    web_search_tool_result, mcp_tool_use, etc.) pass through
+    as OPAQUE — carried faithfully without interpretation.
+    Anthropic adds new block types faster than we can enumerate
+    them, so opaque passthrough is the only stable design.
+    """
     TEXT = "text"
     THINKING = "thinking"
     TOOL_USE = "tool_use"
     REDACTED_THINKING = "redacted_thinking"
+    OPAQUE = "_opaque"  # catch-all for unrecognized block types
 
 
 class DeltaType(Enum):
@@ -86,10 +101,10 @@ class DeltaType(Enum):
     SIGNATURE_DELTA = "signature_delta"
 
 
-# Known type strings for fail-stop validation
+# Known type strings for fail-stop validation on event structure
+# (not block/delta types — those use opaque passthrough)
 _KNOWN_EVENT_TYPES = frozenset(e.value for e in SSEEventType)
-_KNOWN_DELTA_TYPES = frozenset(d.value for d in DeltaType)
-_KNOWN_BLOCK_TYPES = frozenset(b.value for b in BlockType)
+_KNOWN_BLOCK_TYPES = {b.value for b in BlockType if b != BlockType.OPAQUE}
 
 
 # --- Data structures ---
@@ -108,13 +123,15 @@ class ReconstructedBlock:
     """A content block reconstructed from SSE deltas."""
     index: int
     block_type: BlockType
+    # Original type string (for OPAQUE blocks, preserves the wire type)
+    raw_type: str = ""
     # Text blocks
     text: str = ""
     # Thinking blocks
     thinking: str = ""
     signature: str = ""
     # Redacted thinking blocks (no content, just marker)
-    # Tool use blocks
+    # Tool use blocks (including server_tool_use via OPAQUE)
     tool_id: str = ""
     tool_name: str = ""
     input_json: str = ""
@@ -261,13 +278,18 @@ class MessageReconstructor:
     def _on_content_block_start(self, event: SSEEvent) -> None:
         cb = event.data.get("content_block", {})
         block_type_str = cb.get("type", "")
-        if block_type_str not in _KNOWN_BLOCK_TYPES:
-            raise UnrecognizedDeltaError(block_type_str, "content_block_start")
 
-        block_type = BlockType(block_type_str)
+        if block_type_str in _KNOWN_BLOCK_TYPES:
+            block_type = BlockType(block_type_str)
+        else:
+            # Unknown block type — pass through as opaque
+            block_type = BlockType.OPAQUE
+            log.debug("opaque block type: %s", block_type_str)
+
         block = ReconstructedBlock(
             index=event.data.get("index", 0),
             block_type=block_type,
+            raw_type=block_type_str,
         )
 
         # Initialize from content_block_start data
@@ -278,6 +300,12 @@ class MessageReconstructor:
             block.text = cb.get("text", "")
         elif block_type == BlockType.THINKING:
             block.thinking = cb.get("thinking", "")
+        elif block_type == BlockType.OPAQUE:
+            # Opaque blocks may have tool-like fields — capture them
+            if "id" in cb:
+                block.tool_id = cb.get("id", "")
+            if "name" in cb:
+                block.tool_name = cb.get("name", "")
 
         self._current_block = block
         self._state = _ReconstructorState.IN_BLOCK
@@ -288,13 +316,17 @@ class MessageReconstructor:
 
         delta = event.data.get("delta", {})
         delta_type_str = delta.get("type", "")
-        if delta_type_str not in _KNOWN_DELTA_TYPES:
-            raise UnrecognizedDeltaError(
-                delta_type_str, self._current_block.block_type.value
-            )
-
-        delta_type = DeltaType(delta_type_str)
         block = self._current_block
+
+        # Known delta types get structured handling
+        try:
+            delta_type = DeltaType(delta_type_str)
+        except ValueError:
+            # Unknown delta type — accumulate as input_json if it has
+            # partial_json, otherwise ignore. Don't crash.
+            if "partial_json" in delta:
+                block.input_json += delta["partial_json"]
+            return
 
         if delta_type == DeltaType.TEXT_DELTA:
             block.text += delta.get("text", "")
@@ -309,7 +341,9 @@ class MessageReconstructor:
         if self._current_block is not None:
             # Parse accumulated JSON for tool_use blocks
             if (
-                self._current_block.block_type == BlockType.TOOL_USE
+                self._current_block.block_type in (
+                    BlockType.TOOL_USE, BlockType.OPAQUE,
+                )
                 and self._current_block.input_json
             ):
                 try:
